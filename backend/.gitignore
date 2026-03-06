@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+autosci.db
+artifacts/runs/
