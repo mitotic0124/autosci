@@ -1,5 +1,6 @@
-﻿import json
+import json
 import logging
+import re
 import shutil
 import threading
 import time
@@ -12,7 +13,7 @@ from app.core.config import Settings
 from app.db import crud
 from app.db.models import Paper, PaperNote, PublicationTask
 from app.db.session import SessionLocal
-from app.services.arxiv_service import ArxivService
+from app.services.arxiv_service import ArxivService, CandidatePaper
 from app.services.email_service import EmailService
 from app.services.image_service import PaperImageService
 from app.services.llm_service import LLMService
@@ -30,10 +31,18 @@ class WorkflowService:
         "schedule_minute",
         "paper_count",
         "arxiv_max_candidates",
+        "paper_history_lookback_days",
         "imap_port",
         "command_poll_interval_seconds",
     }
-    BOOL_FIELDS = {"smtp_use_tls", "imap_use_ssl", "zhihu_headless", "zhihu_publish_enabled"}
+    BOOL_FIELDS = {
+        "smtp_use_tls",
+        "imap_use_ssl",
+        "zhihu_headless",
+        "zhihu_publish_enabled",
+        "zhihu_auto_publish",
+        "workflow_auto_publish_after_run",
+    }
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -104,7 +113,44 @@ class WorkflowService:
                 for item in fallback_candidates:
                     merged_by_id[item.arxiv_id] = item
                 candidates = list(merged_by_id.values())
-            self._set_step("fetch", "done", f"Fetched {len(candidates)} candidates.")
+            candidates_before_history = list(candidates)
+
+            history_days = max(0, int(self._settings.paper_history_lookback_days))
+            filtered_count = 0
+            if history_days > 0:
+                recent_pairs = crud.list_recent_paper_id_title_pairs(db, lookback_days=history_days)
+                seen_ids = {arxiv_id.strip() for arxiv_id, _ in recent_pairs if arxiv_id}
+                seen_titles = {self._normalize_title(title) for _, title in recent_pairs if title}
+                before_filter = len(candidates)
+                filtered_candidates = self._filter_history_candidates(candidates, seen_ids=seen_ids, seen_titles=seen_titles)
+                filtered_count = before_filter - len(filtered_candidates)
+                if filtered_candidates:
+                    candidates = filtered_candidates
+                elif before_filter > 0:
+                    logger.warning(
+                        "History filter removed all %s candidates within %s day(s); fallback to unfiltered candidates.",
+                        before_filter,
+                        history_days,
+                    )
+                    candidates = candidates_before_history
+                    filtered_count = 0
+
+                if filtered_count > 0 and candidates is filtered_candidates:
+                    logger.info(
+                        "History filter removed %s candidate(s) within %s day(s).",
+                        filtered_count,
+                        history_days,
+                    )
+
+            if not candidates:
+                raise RuntimeError(
+                    "No arXiv candidates available after fetch and fallback window expansion."
+                )
+            self._set_step(
+                "fetch",
+                "done",
+                f"Fetched {len(candidates)} candidates after history filter (removed {filtered_count}).",
+            )
 
             self._set_step("select", "active", "Ranking papers and selecting top candidates.")
             selected = self._arxiv_service.rank_and_pick(candidates, top_k=self._settings.paper_count)
@@ -162,6 +208,68 @@ class WorkflowService:
             self._set_step("note", "done", f"Generated {len(papers)} paper notes.")
 
             publication_tasks = self._publication_service.create_tasks_for_run(db, run_id, papers, notes_map)
+            auto_publish_summary = {
+                "enabled": bool(self._settings.workflow_auto_publish_after_run),
+                "requested": 0,
+                "published": 0,
+                "drafted": 0,
+                "already_published": 0,
+                "failed": 0,
+                "rate_limited": 0,
+                "not_found": 0,
+            }
+            if self._settings.workflow_auto_publish_after_run:
+                auto_codes = [task.paper_code for task in publication_tasks]
+                auto_publish_summary["requested"] = len(auto_codes)
+                if auto_codes:
+                    if not self._settings.zhihu_auto_publish:
+                        logger.info(
+                            "workflow_auto_publish_after_run is enabled while zhihu_auto_publish=false; "
+                            "the auto stage will save drafts."
+                        )
+                    self._set_step("zhihu", "active", f"Auto publishing {len(auto_codes)} paper(s) to Zhihu.")
+                    publish_result = self._publication_service.publish_codes(
+                        db=db,
+                        codes=auto_codes,
+                        sender="auto_workflow",
+                        command_text="auto_publish_after_run",
+                        step_callback=self._on_publish_step,
+                    )
+                    stats = publish_result.get("stats", {})
+                    auto_publish_summary["published"] = int(stats.get("PUBLISHED", 0))
+                    auto_publish_summary["drafted"] = int(stats.get("DRAFT", 0))
+                    auto_publish_summary["already_published"] = int(stats.get("ALREADY_PUBLISHED", 0))
+                    auto_publish_summary["failed"] = int(stats.get("FAILED", 0))
+                    auto_publish_summary["rate_limited"] = int(stats.get("RATE_LIMITED", 0))
+                    auto_publish_summary["not_found"] = int(stats.get("NOT_FOUND", 0))
+                    failed_total = (
+                        auto_publish_summary["failed"]
+                        + auto_publish_summary["rate_limited"]
+                        + auto_publish_summary["not_found"]
+                    )
+                    if failed_total > 0:
+                        self._set_step(
+                            "zhihu",
+                            "failed",
+                            "Auto publish completed with failures: "
+                            f"published={auto_publish_summary['published']}, "
+                            f"draft={auto_publish_summary['drafted']}, failed={failed_total}.",
+                        )
+                    else:
+                        self._set_step(
+                            "zhihu",
+                            "done",
+                            "Auto publish completed: "
+                            f"published={auto_publish_summary['published']}, "
+                            f"draft={auto_publish_summary['drafted']}.",
+                        )
+                else:
+                    self._set_step("zhihu", "done", "No publication tasks to auto publish.")
+            else:
+                self._set_step("zhihu", "pending", "Auto publish after workflow is disabled.")
+
+            # Reload to include updated task statuses after optional auto publish.
+            publication_tasks = crud.list_publication_tasks(db, run_id=run_id)
 
             self._set_step("mail", "active", "Sending paper codes email.")
             email_sent = False
@@ -178,6 +286,7 @@ class WorkflowService:
                 "publication_tasks": len(publication_tasks),
                 "email_sent": email_sent,
                 "email_error": email_error,
+                "auto_publish_after_run": auto_publish_summary,
             }
             crud.finish_run(db, run_id, status="SUCCESS", summary=summary)
             self._finish_progress(success=True, message=f"Run #{run_id} finished successfully.")
@@ -207,6 +316,7 @@ class WorkflowService:
                 "ok": True,
                 "received_commands": summary.received_commands,
                 "published_count": summary.published_count,
+                "drafted_count": summary.drafted_count,
                 "failed_count": summary.failed_count,
                 "ignored_count": summary.ignored_count,
             }
@@ -215,7 +325,7 @@ class WorkflowService:
                 self._set_step(
                     "zhihu",
                     "done" if summary.failed_count == 0 else "failed",
-                    f"Publish finished: success={summary.published_count}, failed={summary.failed_count}.",
+                    f"Publish finished: published={summary.published_count}, draft={summary.drafted_count}, failed={summary.failed_count}.",
                 )
             self._finish_progress(success=summary.failed_count == 0, message="Mailbox polling completed.")
             return result
@@ -457,9 +567,31 @@ class WorkflowService:
                     if status == "active":
                         self._progress["node_status"][step_id] = "done"
 
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        lowered = title.strip().lower()
+        compact = re.sub(r"\s+", " ", lowered)
+        normalized = re.sub(r"[^\w ]", "", compact, flags=re.UNICODE)
+        return normalized.replace("_", "")
+
+    def _filter_history_candidates(
+        self,
+        candidates: list[CandidatePaper],
+        seen_ids: set[str],
+        seen_titles: set[str],
+    ) -> list[CandidatePaper]:
+        filtered: list[CandidatePaper] = []
+        for item in candidates:
+            normalized_title = self._normalize_title(item.title)
+            if item.arxiv_id in seen_ids or normalized_title in seen_titles:
+                continue
+            filtered.append(item)
+        return filtered
+
     def _on_publish_step(self, step_id: str, status: str, message: str) -> None:
         self._set_step(step_id, status, message)
 
     @staticmethod
     def _now_iso() -> str:
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+

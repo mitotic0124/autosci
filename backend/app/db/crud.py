@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session, joinedload
@@ -74,6 +74,15 @@ def list_papers_for_run(db: Session, run_id: int) -> list[Paper]:
         .options(joinedload(Paper.note))
     )
     return list(db.scalars(stmt).all())
+
+
+def list_recent_paper_id_title_pairs(db: Session, lookback_days: int) -> list[tuple[str, str]]:
+    if lookback_days <= 0:
+        return []
+    cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+    stmt = select(Paper.arxiv_id, Paper.title).where(Paper.created_at >= cutoff)
+    rows = db.execute(stmt).all()
+    return [(str(arxiv_id), str(title)) for arxiv_id, title in rows]
 
 
 def get_paper_note(db: Session, paper_id: int) -> PaperNote | None:

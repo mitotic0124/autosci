@@ -71,6 +71,7 @@ export function pollPublicationCommands(): Promise<{
   ok: boolean;
   received_commands?: number;
   published_count?: number;
+  drafted_count?: number;
   failed_count?: number;
   ignored_count?: number;
   message?: string;

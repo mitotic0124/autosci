@@ -52,6 +52,8 @@ const SETTINGS_DESCRIPTION: Record<string, string> = {
   schedule_minute: "每天定时任务触发分钟（0-59）。",
   paper_count: "每天筛选论文数量，当前建议 3 篇。",
   arxiv_max_candidates: "每次从 arXiv 拉取的候选论文上限。",
+  paper_history_lookback_days: "排除近 N 天内已入库论文标题/ID，减少连续多天重复选中同一批论文。",
+  arxiv_extra_keywords: "额外主题关键词（英文逗号分隔），会加入 arXiv 检索与启发式打分。",
   llm_provider: "LLM 提供方类型，openai_compatible 代表 OpenAI 协议兼容接口。",
   llm_api_base_url: "LLM 接口基础地址，可填第三方兼容网关。",
   llm_api_key: "LLM 接口密钥。",
@@ -76,6 +78,8 @@ const SETTINGS_DESCRIPTION: Record<string, string> = {
   zhihu_firefox_profile_path: "Firefox Profile 路径（用于复用登录态）。",
   zhihu_headless: "知乎自动发布是否无头模式，true/false。",
   zhihu_publish_enabled: "是否启用知乎自动发布，true/false。",
+  zhihu_auto_publish: "是否在草稿写入成功后自动点击发布，true/false。建议先设为 false 手工检查。",
+  workflow_auto_publish_after_run: "工作流完成后是否自动执行发布流程，true/false。建议与 zhihu_auto_publish 搭配使用。",
   zhihu_markdown_converter_cmd: "Markdown 转知乎格式命令（如 md2zhihu）。为空则不转换。",
 };
 
@@ -84,6 +88,8 @@ const SETTING_ORDER = [
   "schedule_minute",
   "paper_count",
   "arxiv_max_candidates",
+  "paper_history_lookback_days",
+  "arxiv_extra_keywords",
   "llm_provider",
   "llm_api_base_url",
   "llm_api_key",
@@ -108,6 +114,8 @@ const SETTING_ORDER = [
   "zhihu_firefox_profile_path",
   "zhihu_headless",
   "zhihu_publish_enabled",
+  "zhihu_auto_publish",
+  "workflow_auto_publish_after_run",
   "zhihu_markdown_converter_cmd",
 ];
 
@@ -119,6 +127,7 @@ function summarizeManualResult(result: PublishByCodesResponse): string {
         const key = item.status;
         if (
           key === "PUBLISHED" ||
+          key === "DRAFT" ||
           key === "ALREADY_PUBLISHED" ||
           key === "FAILED" ||
           key === "RATE_LIMITED" ||
@@ -128,16 +137,17 @@ function summarizeManualResult(result: PublishByCodesResponse): string {
         }
         return acc;
       },
-      {
-        PUBLISHED: 0,
-        ALREADY_PUBLISHED: 0,
-        FAILED: 0,
-        RATE_LIMITED: 0,
-        NOT_FOUND: 0,
-      },
+        {
+          PUBLISHED: 0,
+          DRAFT: 0,
+          ALREADY_PUBLISHED: 0,
+          FAILED: 0,
+          RATE_LIMITED: 0,
+          NOT_FOUND: 0,
+        },
     );
 
-  return `手动发布执行完成：请求 ${result.requested.length} 个编号，成功 ${stats.PUBLISHED}，已发布 ${stats.ALREADY_PUBLISHED}，限流 ${stats.RATE_LIMITED}，失败 ${stats.FAILED}，未找到 ${stats.NOT_FOUND}。`;
+  return `手动发布执行完成：请求 ${result.requested.length} 个编号，公开发布 ${stats.PUBLISHED}，草稿保存 ${stats.DRAFT ?? 0}，已发布 ${stats.ALREADY_PUBLISHED}，限流 ${stats.RATE_LIMITED}，失败 ${stats.FAILED}，未找到 ${stats.NOT_FOUND}。`;
 }
 
 export default function App() {
@@ -160,6 +170,9 @@ export default function App() {
     schedule_minute: "0",
     paper_count: "3",
     arxiv_max_candidates: "40",
+    paper_history_lookback_days: "7",
+    arxiv_extra_keywords:
+      "volatility,liquidity,market microstructure,limit order book,transaction cost,return predictability,cross-sectional,alpha",
     llm_provider: "openai_compatible",
     llm_api_base_url: "",
     llm_api_key: "",
@@ -184,6 +197,8 @@ export default function App() {
     zhihu_firefox_profile_path: "",
     zhihu_headless: "false",
     zhihu_publish_enabled: "true",
+    zhihu_auto_publish: "false",
+    workflow_auto_publish_after_run: "false",
     zhihu_markdown_converter_cmd: "md2zhihu",
   });
 
@@ -294,13 +309,13 @@ export default function App() {
     setErrorMessage("");
     try {
       const result = await pollPublicationCommands();
-      if (result.ok) {
-        setStatusMessage(
-          `轮询完成：收到命令 ${result.received_commands ?? 0}，发布成功 ${result.published_count ?? 0}，失败 ${
-            result.failed_count ?? 0
-          }，忽略 ${result.ignored_count ?? 0}。`,
-        );
-      } else {
+        if (result.ok) {
+          setStatusMessage(
+            `轮询完成：收到命令 ${result.received_commands ?? 0}，公开发布 ${result.published_count ?? 0}，草稿保存 ${
+              result.drafted_count ?? 0
+            }，失败 ${result.failed_count ?? 0}，忽略 ${result.ignored_count ?? 0}。`,
+          );
+        } else {
         setStatusMessage(result.message ?? "轮询完成");
       }
       await refreshAll();

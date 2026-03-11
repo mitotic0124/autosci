@@ -16,8 +16,10 @@ class NoteService:
         pdf_text = self._extract_pdf_text(pdf_path) if pdf_path else ""
         llm_note = self._build_with_llm(paper, image_urls, pdf_text)
         if llm_note:
-            return self._normalize_llm_note(llm_note, paper)
-        return self._build_fallback(paper, image_urls, pdf_text)
+            note = self._normalize_llm_note(llm_note, paper)
+        else:
+            note = self._build_fallback(paper, image_urls, pdf_text)
+        return self._ensure_lead_metadata(note, paper)
 
     def _build_with_llm(self, paper: CandidatePaper, image_urls: list[str], pdf_text: str) -> str | None:
         images_markdown = "\n".join(f"- ![图示 {idx}]({url})" for idx, url in enumerate(image_urls, start=1))
@@ -121,6 +123,68 @@ PDF 文本片段（可能截断）：
             cleaned.insert(title_line_index, f"{preferred_prefix}{paper.title}")
 
         return "\n".join(cleaned).strip() + "\n"
+
+    @staticmethod
+    def _ensure_lead_metadata(note: str, paper: CandidatePaper) -> str:
+        text = (note or "").strip()
+        lines = text.splitlines() if text else []
+
+        heading_idx = None
+        for i, line in enumerate(lines):
+            if line.strip():
+                heading_idx = i
+                break
+
+        if heading_idx is None:
+            lines = [f"# arxiv论文速递|{paper.title}"]
+            heading_idx = 0
+
+        meta_start = heading_idx + 1
+        # Skip blank lines after heading.
+        while meta_start < len(lines) and not lines[meta_start].strip():
+            meta_start += 1
+
+        # Remove an existing top metadata block to avoid duplicates.
+        meta_end = meta_start
+        while meta_end < len(lines):
+            stripped = lines[meta_end].strip().lower()
+            if not stripped:
+                break
+            if any(
+                stripped.startswith(prefix)
+                for prefix in (
+                    "作者",
+                    "- 作者",
+                    "authors",
+                    "- authors",
+                    "author",
+                    "- author",
+                    "arxiv",
+                    "- arxiv",
+                    "链接",
+                    "- 链接",
+                    "link",
+                    "- link",
+                )
+            ):
+                meta_end += 1
+                continue
+            break
+
+        before = lines[: heading_idx + 1]
+        after = lines[meta_end:]
+        if after and after[0].strip():
+            after = [""] + after
+
+        authors = ", ".join(paper.authors) if paper.authors else "未知"
+        metadata_lines = [
+            "",
+            f"- 作者：{authors}",
+            f"- arXiv 链接：{paper.url}",
+            "",
+        ]
+        merged = before + metadata_lines + after
+        return "\n".join(merged).strip() + "\n"
 
     @staticmethod
     def _extract_pdf_text(pdf_path: Path, max_pages: int = 18, max_chars: int = 30000) -> str:

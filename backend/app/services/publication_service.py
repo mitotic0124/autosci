@@ -14,6 +14,7 @@ from app.services.zhihu_service import ZhihuService
 class PublicationSummary:
     received_commands: int
     published_count: int
+    drafted_count: int
     failed_count: int
     ignored_count: int
 
@@ -59,6 +60,7 @@ class PublicationService:
             step_callback("reply", "active", f"Received {len(commands)} command email(s).")
 
         published_count = 0
+        drafted_count = 0
         failed_count = 0
         ignored_count = 0
 
@@ -96,16 +98,21 @@ class PublicationService:
                 try:
                     publish_title = self._pick_publish_title(task.note_markdown, task.title)
                     url = self._zhihu_service.publish_article(publish_title, task.note_markdown)
+                    final_status = self._status_from_result_url(url)
                     crud.update_publication_task(
                         db,
                         task.id,
-                        status="PUBLISHED",
+                        status=final_status,
                         zhihu_url=url,
                         command_text=cmd.command_text,
                         requested_by=cmd.sender,
                     )
-                    published_count += 1
-                    cmd_success.append(f"{code}: published")
+                    if final_status == "PUBLISHED":
+                        published_count += 1
+                        cmd_success.append(f"{code}: published")
+                    else:
+                        drafted_count += 1
+                        cmd_success.append(f"{code}: draft saved")
                 except Exception as exc:
                     failed_status = self._status_from_exception(exc)
                     crud.update_publication_task(
@@ -135,6 +142,7 @@ class PublicationService:
         return PublicationSummary(
             received_commands=len(commands),
             published_count=published_count,
+            drafted_count=drafted_count,
             failed_count=failed_count,
             ignored_count=ignored_count,
         )
@@ -165,15 +173,16 @@ class PublicationService:
             try:
                 publish_title = self._pick_publish_title(task.note_markdown, task.title)
                 url = self._zhihu_service.publish_article(publish_title, task.note_markdown)
+                final_status = self._status_from_result_url(url)
                 crud.update_publication_task(
                     db,
                     task.id,
-                    status="PUBLISHED",
+                    status=final_status,
                     zhihu_url=url,
                     command_text=command_text or "manual_publish",
                     requested_by=sender,
                 )
-                results.append({"code": code, "status": "PUBLISHED", "zhihu_url": url})
+                results.append({"code": code, "status": final_status, "zhihu_url": url})
             except Exception as exc:
                 failed_status = self._status_from_exception(exc)
                 crud.update_publication_task(
@@ -188,6 +197,7 @@ class PublicationService:
 
         stats = {
             "PUBLISHED": 0,
+            "DRAFT": 0,
             "ALREADY_PUBLISHED": 0,
             "FAILED": 0,
             "RATE_LIMITED": 0,
@@ -224,3 +234,10 @@ class PublicationService:
         if "发布频率过高" in text or "知乎发布冷却中" in text or "触发24小时冷却" in text:
             return "RATE_LIMITED"
         return "FAILED"
+
+    def _status_from_result_url(self, url: str | None) -> str:
+        if not self._settings.zhihu_auto_publish:
+            return "DRAFT"
+        if self._is_edit_url(url):
+            return "DRAFT"
+        return "PUBLISHED"

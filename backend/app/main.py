@@ -55,11 +55,19 @@ def on_startup() -> None:
         "schedule_minute",
         "paper_count",
         "arxiv_max_candidates",
+        "paper_history_lookback_days",
         "smtp_port",
         "imap_port",
         "command_poll_interval_seconds",
     }
-    bool_fields = {"smtp_use_tls", "imap_use_ssl", "zhihu_headless", "zhihu_publish_enabled"}
+    bool_fields = {
+        "smtp_use_tls",
+        "imap_use_ssl",
+        "zhihu_headless",
+        "zhihu_publish_enabled",
+        "zhihu_auto_publish",
+        "workflow_auto_publish_after_run",
+    }
     for key, value in runtime.items():
         if not hasattr(settings, key):
             continue

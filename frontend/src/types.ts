@@ -100,7 +100,7 @@ export type RunDetail = {
 };
 
 export type SettingsPayload = {
-  defaults: Record<string, string | number>;
+  defaults: Record<string, string | number | boolean>;
   runtime: Record<string, string>;
 };
 
@@ -114,6 +114,7 @@ export type PublishByCodesResponse = {
   }>;
   stats?: {
     PUBLISHED: number;
+    DRAFT?: number;
     ALREADY_PUBLISHED: number;
     FAILED: number;
     RATE_LIMITED?: number;

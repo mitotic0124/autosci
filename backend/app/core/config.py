@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     arxiv_base_url: str = "http://export.arxiv.org/api/query"
     arxiv_max_candidates: int = 40
     paper_count: int = 3
+    paper_history_lookback_days: int = 7
+    arxiv_extra_keywords: str = (
+        "volatility,liquidity,market microstructure,limit order book,"
+        "transaction cost,return predictability,cross-sectional,alpha"
+    )
     schedule_hour: int = 6
     schedule_minute: int = 0
 
@@ -58,6 +63,8 @@ class Settings(BaseSettings):
     zhihu_firefox_profile_path: str | None = None
     zhihu_headless: bool = False
     zhihu_publish_enabled: bool = True
+    zhihu_auto_publish: bool = False
+    workflow_auto_publish_after_run: bool = False
     zhihu_markdown_converter_cmd: str = "md2zhihu"
 
     frontend_origin: str = "http://localhost:5173"

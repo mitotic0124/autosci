@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import re
 
 import feedparser
 import requests
@@ -24,7 +25,11 @@ class ArxivService:
     def __init__(self, settings: Settings, llm_service: LLMService) -> None:
         self._settings = settings
         self._llm_service = llm_service
-        self._keywords = {
+        self._query_keywords = self._build_query_keywords()
+        self._keywords = self._build_weighted_keywords()
+
+    def _build_weighted_keywords(self) -> dict[str, float]:
+        keywords = {
             "daily": 12.0,
             "intraday": 14.0,
             "high-frequency": 16.0,
@@ -34,16 +39,66 @@ class ArxivService:
             "asset pricing": 10.0,
             "portfolio": 8.0,
             "china": 6.0,
-            "market microstructure": 8.0,
+            "market microstructure": 12.0,
             "machine learning": 8.0,
+            "volatility": 10.0,
+            "liquidity": 10.0,
+            "limit order book": 12.0,
+            "transaction cost": 9.0,
+            "return predictability": 10.0,
+            "cross-sectional": 9.0,
+            "cross section": 9.0,
+            "alpha": 8.0,
         }
+        for keyword in self._parse_extra_keywords(self._settings.arxiv_extra_keywords):
+            keywords.setdefault(keyword, 7.0)
+        return keywords
+
+    def _build_query_keywords(self) -> list[str]:
+        base_keywords = [
+            "daily",
+            "intraday",
+            "high frequency",
+            "factor",
+            "asset pricing",
+            "volatility",
+            "liquidity",
+            "market microstructure",
+            "limit order book",
+            "transaction cost",
+            "return predictability",
+            "cross-sectional",
+            "alpha",
+        ]
+        merged = base_keywords + self._parse_extra_keywords(self._settings.arxiv_extra_keywords)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for keyword in merged:
+            normalized = keyword.strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    @staticmethod
+    def _parse_extra_keywords(raw: str | None) -> list[str]:
+        if not raw:
+            return []
+        return [item.strip().lower() for item in re.split(r"[,，;\n；]+", raw) if item.strip()]
+
+    def _build_search_query(self) -> str:
+        categories = "(cat:q-fin.ST OR cat:q-fin.TR OR cat:q-fin.PM OR cat:q-fin.CP OR cat:q-fin.MF)"
+        keyword_query_items: list[str] = []
+        for keyword in self._query_keywords:
+            token = f'all:"{keyword}"' if any(ch in keyword for ch in {" ", "-", ":"}) else f"all:{keyword}"
+            keyword_query_items.append(token)
+        keyword_query = " OR ".join(keyword_query_items)
+        return f"{categories} AND ({keyword_query})"
 
     def fetch_recent_candidates(self, hours_back: int = 48) -> list[CandidatePaper]:
         params = {
-            "search_query": (
-                "(cat:q-fin.ST OR cat:q-fin.TR OR cat:q-fin.PM OR cat:q-fin.CP OR cat:q-fin.MF) "
-                "AND (all:daily OR all:intraday OR all:\"high frequency\" OR all:factor OR all:\"asset pricing\")"
-            ),
+            "search_query": self._build_search_query(),
             "sortBy": "submittedDate",
             "sortOrder": "descending",
             "start": 0,

@@ -35,7 +35,8 @@ class ZhihuService:
     def publish_article(self, title: str, markdown_content: str) -> str:
         if not self._settings.zhihu_publish_enabled:
             raise RuntimeError("知乎发布功能已禁用。")
-        self._ensure_not_rate_limited()
+        if self._settings.zhihu_auto_publish:
+            self._ensure_not_rate_limited()
 
         profile_path = self._resolve_firefox_profile_path()
         if not profile_path:
@@ -46,7 +47,7 @@ class ZhihuService:
             body = body[:18000] + "\n\n（内容过长，已截断，请在系统中查看完整笔记。）"
 
         body = self._convert_markdown_for_zhihu(body)
-        body_text, image_files = self._split_body_and_images(body)
+        body_text, image_slots = self._split_body_and_images(body)
 
         with sync_playwright() as playwright:
             launch_profile = self._prepare_launch_profile(profile_path)
@@ -57,24 +58,33 @@ class ZhihuService:
                 viewport={"width": 1366, "height": 900},
             )
             try:
-                page = context.pages[0] if context.pages else context.new_page()
+                page = context.new_page()
+                self._ensure_browser_interactable(page)
                 page.goto(self._settings.zhihu_column_url or "https://zhuanlan.zhihu.com/write", wait_until="domcontentloaded", timeout=60_000)
+                self._ensure_browser_interactable(page)
                 page.wait_for_timeout(2000)
                 self._check_access_block(page)
-                self._check_publish_rate_limit(page, stage="打开写作页")
+                if self._settings.zhihu_auto_publish:
+                    self._check_publish_rate_limit(page, stage="打开写作页")
 
                 current_url = page.url.lower()
                 if "signin" in current_url or "login" in current_url:
                     raise RuntimeError(f"检测到知乎未登录或登录态失效，当前URL: {page.url}")
 
+                self._ensure_browser_interactable(page)
                 title_filled = self._fill_title(page, title)
                 if not title_filled:
                     body_text = f"{title}\n\n{body_text}"
 
                 self._check_access_block(page)
-                self._fill_body(page, body_text)
+                fill_mode = self._fill_body(page, body_text)
                 self._assert_body_written(page, min_chars=30)
-                self._upload_images(page, image_files)
+                self._assert_draft_rendered(page, body_text, fill_mode)
+                self._upload_images(page, image_slots)
+                if not self._settings.zhihu_auto_publish:
+                    page.wait_for_timeout(1500)
+                    return self._resolve_draft_url(page)
+                self._ensure_browser_interactable(page)
                 self._click_publish(page)
                 self._check_publish_rate_limit(page, stage="点击发布后")
                 page.wait_for_timeout(2500)
@@ -92,6 +102,56 @@ class ZhihuService:
                 raise RuntimeError(f"{exc} | 调试快照: {debug_path}") from exc
             finally:
                 context.close()
+
+    def _ensure_browser_interactable(self, page) -> None:
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            page.evaluate(
+                """
+                () => {
+                  try { window.focus(); } catch (e) {}
+                  const el = document.activeElement;
+                  if (el && typeof el.blur === "function") {
+                    try { el.blur(); } catch (e) {}
+                  }
+                  return true;
+                }
+                """
+            )
+        except Exception:
+            pass
+        if self._settings.zhihu_headless:
+            return
+        self._activate_firefox_window()
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _activate_firefox_window() -> None:
+        if os.name != "nt":
+            return
+        powershell_cmd = (
+            "Add-Type -AssemblyName Microsoft.VisualBasic; "
+            "$targets = @('Firefox','Mozilla Firefox','火狐','Mozilla'); "
+            "foreach($t in $targets){ "
+            "  try { if([Microsoft.VisualBasic.Interaction]::AppActivate($t)){ break } } catch {} "
+            "}"
+        )
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", powershell_cmd],
+                check=False,
+                timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _click_publish(page) -> None:
@@ -143,11 +203,13 @@ class ZhihuService:
 
         return False
 
-    def _fill_body(self, page, body: str) -> None:
-        if self._fill_markdown_textarea(page, body):
-            return
+    def _fill_body(self, page, body: str) -> str:
         if self._import_markdown_file(page, body):
-            return
+            return "markdown_import"
+        if self._fill_markdown_textarea(page, body):
+            return "markdown_textarea"
+        if self._looks_like_markdown_body(body):
+            raise RuntimeError("未找到知乎 Markdown 导入入口，已中止发布以避免草稿显示源码。")
 
         selectors = [
             "div.public-DraftEditor-content",
@@ -172,7 +234,7 @@ class ZhihuService:
                     locator.fill(body)
                 except Exception:
                     page.keyboard.insert_text(body)
-                return
+                return "rich_text_fallback"
         raise RuntimeError("未找到知乎正文编辑器，页面结构可能已变化。")
 
     @staticmethod
@@ -180,6 +242,9 @@ class ZhihuService:
         selectors = [
             "textarea[placeholder*='请输入正文']",
             "textarea[placeholder*='正文']",
+            "textarea[placeholder*='Markdown']",
+            "textarea[aria-label*='正文']",
+            "textarea[aria-label*='Markdown']",
         ]
         for selector in selectors:
             locator = page.locator(selector).first
@@ -187,6 +252,7 @@ class ZhihuService:
                 continue
             locator.click()
             locator.fill(body)
+            page.wait_for_timeout(600)
             return True
         return False
 
@@ -196,52 +262,390 @@ class ZhihuService:
         md_path = temp_dir / f"zhihu_import_{int(time.time() * 1000)}.md"
         md_path.write_text(body, encoding="utf-8")
 
-        def try_set_file() -> bool:
-            file_inputs = page.locator(
-                "input[type='file'][accept*='.md'], "
-                "input[type='file'][accept*='markdown'], "
-                "input[type='file'][accept*='text/plain']"
-            )
-            if file_inputs.count() == 0:
+        def is_doc_accept(accept: str) -> bool:
+            text = (accept or "").lower()
+            if not text:
                 return False
+            tokens = (
+                ".md",
+                "markdown",
+                "text/plain",
+                "text/markdown",
+                ".doc",
+                ".docx",
+                "application/msword",
+                "officedocument.wordprocessingml.document",
+            )
+            return any(token in text for token in tokens)
+
+        def try_set_file(scope=None) -> bool:
+            host = scope or page
+            selectors = [
+                "input[type='file'][accept*='.md']",
+                "input[type='file'][accept*='markdown']",
+                "input[type='file'][accept*='text/markdown']",
+                "input[type='file'][accept*='text/plain']",
+                "input[type='file'][accept*='.doc']",
+                "input[type='file'][accept*='.docx']",
+                "input[type='file'][accept*='msword']",
+                "input[type='file'][accept*='officedocument.wordprocessingml.document']",
+            ]
+            for selector in selectors:
+                file_inputs = host.locator(selector)
+                count = min(file_inputs.count(), 5)
+                for idx in range(count):
+                    try:
+                        file_inputs.nth(idx).set_input_files(str(md_path))
+                        page.wait_for_timeout(3200)
+                        return True
+                    except Exception:
+                        continue
+            generic_inputs = host.locator("input[type='file']")
+            count = min(generic_inputs.count(), 8)
+            for idx in range(count):
+                item = generic_inputs.nth(idx)
+                try:
+                    accept = (item.get_attribute("accept") or "").lower()
+                except Exception:
+                    accept = ""
+                if accept and not is_doc_accept(accept):
+                    continue
+                try:
+                    item.set_input_files(str(md_path))
+                    page.wait_for_timeout(3200)
+                    return True
+                except Exception:
+                    continue
+            return False
+
+        def try_file_chooser(locator) -> bool:
             try:
-                file_inputs.first.set_input_files(str(md_path))
-                page.wait_for_timeout(2200)
+                with page.expect_file_chooser(timeout=4_500) as chooser_info:
+                    locator.click(timeout=4_500)
+                chooser_info.value.set_files(str(md_path))
+                page.wait_for_timeout(3200)
                 return True
             except Exception:
                 return False
+
+        def try_choose_local_document() -> bool:
+            for label in ("选择本地文档", "选择本地文件", "本地文档", "本地文件", "上传文档", "上传文件"):
+                button = page.get_by_role("button", name=label).first
+                if button.count() == 0:
+                    continue
+                if try_file_chooser(button):
+                    return True
+                try:
+                    button.click(timeout=4_500)
+                    page.wait_for_timeout(500)
+                except Exception:
+                    continue
+                if try_set_file():
+                    return True
+            dialog = page.locator("[role='dialog']").last
+            if dialog.count() > 0 and try_set_file(dialog):
+                return True
+            return False
+
+        def try_menu_entries() -> bool:
+            for menu_label in (
+                "导入文档",
+                "导入文档 MD/Doc",
+                "导入文档 MD/DOC",
+                "MD/Doc",
+                "MD/DOC",
+                "Markdown 文件",
+                "Markdown",
+                "导入 Markdown",
+                "上传 Markdown",
+                "本地文件",
+                "本地文档",
+            ):
+                for role in ("menuitem", "button"):
+                    menu_entry = page.get_by_role(role, name=menu_label).first
+                    if menu_entry.count() == 0:
+                        continue
+                    if try_file_chooser(menu_entry):
+                        return True
+                    try:
+                        menu_entry.click(timeout=4_500)
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        continue
+                    if try_set_file():
+                        return True
+                    if try_choose_local_document():
+                        return True
+            return False
+
+        if try_set_file():
+            return True
 
         for label in ("导入 Markdown", "导入markdown", "导入文档", "导入", "Markdown"):
             button = page.get_by_role("button", name=label).first
             if button.count() == 0:
                 continue
+            if try_file_chooser(button):
+                return True
+            page.wait_for_timeout(500)
+            if try_set_file():
+                return True
+            if try_menu_entries():
+                return True
+            if try_choose_local_document():
+                return True
             try:
                 button.click(timeout=8_000)
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(600)
                 if try_set_file():
+                    return True
+                if try_menu_entries():
+                    return True
+                if try_choose_local_document():
                     return True
             except Exception:
                 continue
 
         return False
 
+    def _upload_images(self, page, image_slots: list[tuple[str, Path]]) -> None:
+        if not image_slots:
+            return
+
+        valid_slots = [(marker, path) for marker, path in image_slots if path.exists()]
+        if not valid_slots:
+            return
+
+        limited_slots = valid_slots[:9]
+        total = len(limited_slots)
+        for idx, (marker, path) in enumerate(limited_slots, start=1):
+            is_last = idx == total
+            uploaded = False
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                if not self._set_cursor_to_marker(page, marker):
+                    self._move_cursor_to_end(page)
+                try:
+                    self._upload_inline_image_at_cursor(
+                        page,
+                        path,
+                        timeout_ms=22_000 if is_last else 15_000,
+                    )
+                    uploaded = True
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    self._ensure_browser_interactable(page)
+                    page.wait_for_timeout(900)
+            if not uploaded:
+                raise RuntimeError(
+                    f"图片插入失败（{idx}/{total}）：{path.name}"
+                    + (f"；原因：{last_error}" if last_error else "")
+                )
+            self._remove_marker_text(page, marker)
+            if is_last:
+                page.wait_for_timeout(1200)
+
+    def _upload_inline_image_at_cursor(self, page, image_path: Path, timeout_ms: int = 15_000) -> None:
+        selectors = [
+            "input[type='file'][multiple][accept*='image/webp']",
+            "input[type='file'][multiple][accept*='image']",
+            "input[type='file'][accept*='image/webp']",
+            "input[type='file'][accept*='image']",
+        ]
+        for selector in selectors:
+            file_inputs = page.locator(selector)
+            count = min(file_inputs.count(), 6)
+            for idx in range(count):
+                input_locator = file_inputs.nth(idx)
+                try:
+                    accept = (input_locator.get_attribute("accept") or "").lower()
+                except Exception:
+                    accept = ""
+                if accept and "image" not in accept:
+                    continue
+                try:
+                    input_locator.set_input_files(str(image_path))
+                    self._wait_image_upload_stable(page, timeout_ms=timeout_ms)
+                    return
+                except RuntimeError:
+                    raise
+                except Exception:
+                    continue
+        raise RuntimeError(f"未找到正文图片上传入口，无法插入图片：{image_path.name}")
+
     @staticmethod
-    def _upload_images(page, image_files: list[Path]) -> None:
-        if not image_files:
+    def _wait_image_upload_stable(page, timeout_ms: int = 15_000) -> None:
+        deadline = time.time() + timeout_ms / 1000.0
+        stable_rounds = 0
+        while time.time() < deadline:
+            if page.get_by_text("素材文件加载失败").count() > 0 or page.get_by_text("文件加载失败").count() > 0:
+                raise RuntimeError("图片上传失败：知乎提示“素材文件加载失败”。")
+            if page.get_by_text("上传失败").count() > 0:
+                raise RuntimeError("图片上传失败：知乎提示“上传失败”。")
+
+            pending = (
+                page.get_by_text("上传中").count() > 0
+                or page.get_by_text("处理中").count() > 0
+                or page.get_by_text("加载中").count() > 0
+                or page.locator("[role='progressbar']").count() > 0
+                or page.locator("[class*='progress']").count() > 0
+            )
+            if pending:
+                stable_rounds = 0
+            else:
+                stable_rounds += 1
+                if stable_rounds >= 3:
+                    return
+            page.wait_for_timeout(450)
+
+        # Timeout without explicit failure text: continue, but with conservative extra wait.
+        page.wait_for_timeout(800)
+
+    @staticmethod
+    def _set_cursor_to_marker(page, marker: str) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """
+                    (target) => {
+                      const textareas = Array.from(document.querySelectorAll("textarea"));
+                      for (const ta of textareas) {
+                        const value = ta && typeof ta.value === "string" ? ta.value : "";
+                        const idx = value.indexOf(target);
+                        if (idx >= 0) {
+                          ta.focus();
+                          ta.setSelectionRange(idx, idx);
+                          return true;
+                        }
+                      }
+                      const root =
+                        document.querySelector("div.public-DraftEditor-content") ||
+                        document.querySelector("[data-contents='true']") ||
+                        document.querySelector("main") ||
+                        document.body;
+                      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                      let node = walker.nextNode();
+                      while (node) {
+                        const value = node.nodeValue || "";
+                        const idx = value.indexOf(target);
+                        if (idx >= 0) {
+                          const range = document.createRange();
+                          range.setStart(node, idx);
+                          range.setEnd(node, idx);
+                          const sel = window.getSelection();
+                          if (sel) {
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                          }
+                          const editable = node.parentElement && node.parentElement.closest("[contenteditable='true']");
+                          if (editable) {
+                            editable.focus();
+                          }
+                          return true;
+                        }
+                        node = walker.nextNode();
+                      }
+                      return false;
+                    }
+                    """,
+                    marker,
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _move_cursor_to_end(page) -> None:
+        try:
+            page.evaluate(
+                """
+                () => {
+                  const textarea = document.querySelector("textarea");
+                  if (textarea && typeof textarea.value === "string") {
+                    const len = textarea.value.length;
+                    textarea.focus();
+                    textarea.setSelectionRange(len, len);
+                    return;
+                  }
+                  const editable = document.querySelector("div[contenteditable='true']:not([data-placeholder*='标题'])");
+                  if (!editable) return;
+                  editable.focus();
+                  const range = document.createRange();
+                  range.selectNodeContents(editable);
+                  range.collapse(false);
+                  const sel = window.getSelection();
+                  if (sel) {
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                  }
+                }
+                """
+            )
+        except Exception:
             return
 
-        valid = [path for path in image_files if path.exists()]
-        if not valid:
-            return
+    @staticmethod
+    def _select_marker_text(page, marker: str) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """
+                    (target) => {
+                      const textareas = Array.from(document.querySelectorAll("textarea"));
+                      for (const ta of textareas) {
+                        const value = ta && typeof ta.value === "string" ? ta.value : "";
+                        const idx = value.indexOf(target);
+                        if (idx >= 0) {
+                          ta.focus();
+                          ta.setSelectionRange(idx, idx + target.length);
+                          return true;
+                        }
+                      }
+                      const root =
+                        document.querySelector("div.public-DraftEditor-content") ||
+                        document.querySelector("[data-contents='true']") ||
+                        document.querySelector("main") ||
+                        document.body;
+                      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                      let node = walker.nextNode();
+                      while (node) {
+                        const value = node.nodeValue || "";
+                        const idx = value.indexOf(target);
+                        if (idx >= 0) {
+                          const range = document.createRange();
+                          range.setStart(node, idx);
+                          range.setEnd(node, idx + target.length);
+                          const sel = window.getSelection();
+                          if (sel) {
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                          }
+                          const editable = node.parentElement && node.parentElement.closest("[contenteditable='true']");
+                          if (editable) {
+                            editable.focus();
+                          }
+                          return true;
+                        }
+                        node = walker.nextNode();
+                      }
+                      return false;
+                    }
+                    """,
+                    marker,
+                )
+            )
+        except Exception:
+            return False
 
-        file_inputs = page.locator("input[type='file'][accept*='image']")
-        if file_inputs.count() == 0:
+    def _remove_marker_text(self, page, marker: str) -> None:
+        if not self._select_marker_text(page, marker):
             return
-
-        file_inputs.first.set_input_files([str(path) for path in valid[:9]])
-        page.wait_for_timeout(2600)
-        if page.get_by_text("素材文件加载失败").count() > 0:
-            raise RuntimeError("图片上传失败：知乎提示“素材文件加载失败”。")
+        try:
+            page.keyboard.press("Delete")
+            page.wait_for_timeout(300)
+        except Exception:
+            return
 
     @staticmethod
     def _assert_body_written(page, min_chars: int = 20) -> None:
@@ -265,36 +669,209 @@ class ZhihuService:
         except Exception:
             length = 0
         if int(length) < min_chars:
+            hints = ""
+            try:
+                hints = page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText : ''")
+            except Exception:
+                hints = ""
+            for token in ("文件加载失败", "素材文件加载失败", "导入失败", "上传失败"):
+                if isinstance(hints, str) and token in hints:
+                    raise RuntimeError(f"正文导入失败：知乎提示“{token}”。")
             raise RuntimeError(f"正文写入校验失败，当前正文长度仅 {length} 字符。")
 
-    def _split_body_and_images(self, body: str) -> tuple[str, list[Path]]:
-        image_paths: list[Path] = []
+    def _assert_draft_rendered(self, page, source_body: str, fill_mode: str) -> None:
+        if not self._looks_like_markdown_body(source_body):
+            return
+        page.wait_for_timeout(1200)
+        editor_text = self._read_editor_text(page).strip()
+        if not editor_text:
+            return
+        if self._looks_like_raw_markdown(editor_text):
+            preview = editor_text.replace("\n", " ")[:120]
+            raise RuntimeError(f"知乎草稿仍显示 Markdown 源码（mode={fill_mode}，preview={preview}），已中止发布。")
+
+    @staticmethod
+    def _read_editor_text(page) -> str:
+        try:
+            content = page.evaluate(
+                """
+                () => {
+                  const textNodes = Array.from(document.querySelectorAll("[data-contents='true'] [data-text='true']"));
+                  if (textNodes.length > 0) {
+                    return textNodes.slice(0, 320).map(node => node.textContent || "").join("\\n");
+                  }
+                  const textarea = document.querySelector("textarea");
+                  if (textarea && 'value' in textarea) {
+                    return textarea.value || '';
+                  }
+                  const editable = document.querySelector("div[contenteditable='true']:not([data-placeholder*='标题'])");
+                  if (editable) {
+                    return editable.innerText || editable.textContent || '';
+                  }
+                  return '';
+                }
+                """
+            )
+            return content if isinstance(content, str) else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _looks_like_markdown_body(text: str) -> bool:
+        checks = 0
+        patterns = (
+            r"(?m)^\s{0,3}#{1,6}\s+\S",
+            r"(?m)^\s{0,3}>+\s+\S",
+            r"!\[[^\]]*\]\([^)]+\)",
+            r"(?m)^\s*\|.+\|\s*$",
+            r"(?m)^\s*```",
+            r"\$\$[\s\S]{1,1200}?\$\$",
+        )
+        for pattern in patterns:
+            if re.search(pattern, text):
+                checks += 1
+        return checks >= 1
+
+    @staticmethod
+    def _looks_like_raw_markdown(text: str) -> bool:
+        hits = 0
+        patterns = (
+            r"(?m)^\s{0,3}#{1,6}\s+\S",
+            r"(?m)^\s{0,3}>+\s+\S",
+            r"(?m)^\s*```",
+            r"!\[[^\]]*\]\([^)]+\)",
+            r"\$\$[\s\S]{1,1200}?\$\$",
+            r"(?m)^\s*\|(?:\s*:?-{2,}:?\s*\|)+\s*$",
+        )
+        for pattern in patterns:
+            if re.search(pattern, text):
+                hits += 1
+        return hits >= 1
+
+    def _split_body_and_images(self, body: str) -> tuple[str, list[tuple[str, Path]]]:
+        image_slots: list[tuple[str, Path]] = []
+
+        def push_slot(file_path: Path) -> str:
+            marker = f"[[AUTOSCI_IMG_{len(image_slots) + 1:03d}]]"
+            image_slots.append((marker, file_path))
+            return marker
 
         def replace_image(match: re.Match) -> str:
-            alt = (match.group(1) or "图").strip()
             url = (match.group(2) or "").strip()
             file_path = self._resolve_local_image_path(url)
             if file_path:
-                image_paths.append(file_path)
-                return f"\n[{alt}]\n"
+                return f"\n{push_slot(file_path)}\n"
             return match.group(0)
 
         body_text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, body)
-        return body_text, image_paths
+
+        def replace_html_img(match: re.Match) -> str:
+            whole = match.group(0)
+            src = (match.group(1) or "").strip()
+            file_path = self._resolve_local_image_path(src)
+            if file_path:
+                return f"\n{push_slot(file_path)}\n"
+            return whole
+
+        body_text = re.sub(r"""<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>""", replace_html_img, body_text, flags=re.IGNORECASE)
+        return body_text, image_slots
 
     def _resolve_local_image_path(self, url: str) -> Path | None:
         if not url:
             return None
-        if url.startswith("http://") or url.startswith("https://"):
+        normalized = url.strip().strip("'\"").split("?", 1)[0].split("#", 1)[0]
+        if not normalized:
             return None
-        if url.startswith("/artifacts/"):
-            rel = url[len("/artifacts/") :]
-            path = Path(self._settings.artifacts_dir) / rel
+        lower = normalized.lower()
+        if lower.startswith("http://") or lower.startswith("https://"):
+            return None
+        normalized = normalized.replace("\\", "/")
+
+        backend_root = Path(__file__).resolve().parents[2]
+        workspace_root = backend_root.parent
+        artifacts_root = Path(self._settings.artifacts_dir).resolve()
+
+        candidates: list[Path] = []
+        raw = Path(normalized)
+        if raw.is_absolute():
+            candidates.append(raw)
         else:
-            path = Path(url)
-            if not path.is_absolute():
-                path = Path(self._settings.artifacts_dir) / url.lstrip("/")
-        return path if path.exists() else None
+            for base in (Path.cwd(), artifacts_root, artifacts_root.parent, backend_root, workspace_root):
+                candidates.append((base / raw).resolve(strict=False))
+
+        if normalized.startswith("/artifacts/"):
+            rel = normalized[len("/artifacts/") :].lstrip("/")
+            candidates.append((artifacts_root / rel).resolve(strict=False))
+
+        marker_match = re.search(r"(?:^|/)(_md2/.+)$", normalized, flags=re.IGNORECASE)
+        if marker_match:
+            tail = marker_match.group(1)
+            candidates.extend(
+                [
+                    (workspace_root / tail).resolve(strict=False),
+                    (backend_root / tail).resolve(strict=False),
+                ]
+            )
+            basename = Path(tail).name
+            for folder in (
+                workspace_root / "_md2" / "input",
+                backend_root / "_md2" / "input",
+            ):
+                candidates.append((folder / basename).resolve(strict=False))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def _resolve_draft_url(self, page) -> str:
+        current = page.url
+        if self._is_edit_url(current):
+            return current
+
+        match = re.search(r"/p/(\d+)", current)
+        if match:
+            return f"https://zhuanlan.zhihu.com/p/{match.group(1)}/edit"
+
+        try:
+            links = page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll("a[href]"))
+                  .map(item => item.href || "")
+                  .filter(Boolean)
+                  .slice(0, 400)
+                """
+            )
+            if isinstance(links, list):
+                for href in links:
+                    if not isinstance(href, str):
+                        continue
+                    if "/p/" not in href:
+                        continue
+                    id_match = re.search(r"/p/(\\d+)", href)
+                    if id_match:
+                        return f"https://zhuanlan.zhihu.com/p/{id_match.group(1)}/edit"
+        except Exception:
+            pass
+
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        html_match = re.search(r"https?://zhuanlan\\.zhihu\\.com/p/(\\d+)/edit", html)
+        if html_match:
+            return html_match.group(0)
+
+        return current
+
+    @staticmethod
+    def _is_edit_url(url: str | None) -> bool:
+        return bool(url and "/edit" in url)
 
     def _verify_published_url(self, page) -> str:
         self._check_publish_rate_limit(page, stage="发布结果校验")
