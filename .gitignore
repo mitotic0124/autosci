@@ -24,6 +24,8 @@ ENV/
 pip-wheel-metadata/
 
 # Env files
+*.pem
+kimikey.txt
 .env
 .env.*
 !.env.example
@@ -34,6 +36,7 @@ backend/.env.*
 # Node / Frontend
 node_modules/
 frontend/node_modules/
+.playwright-cli/
 dist/
 frontend/dist/
 *.tsbuildinfo
@@ -47,6 +50,7 @@ artifacts/
 backend/artifacts/
 _md2/
 backend/logs/
+backend/backups/
 *.log
 
 # Local databases
@@ -55,4 +59,3 @@ backend/autosci.db
 *.sqlite
 *.sqlite3
 *.db
-

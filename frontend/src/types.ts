@@ -8,6 +8,25 @@
   error_message: string | null;
 };
 
+export type ServiceHealth = {
+  status: string;
+  running: boolean;
+  public_publication: boolean;
+  automatic_publication: boolean;
+  automation_issues?: string[];
+  daily_workflow?: {
+    date: string;
+    scheduled_at: string;
+    attempts: number;
+    last_run_id: number | null;
+    last_status: string | null;
+    due: boolean;
+    reason: string;
+  };
+  zhihu_rate_limit?: { active: boolean; until?: string | null; reason?: string; public_readback_mode?: string | null; public_readback_reason?: string };
+  scheduler: { running: boolean; timezone: string; jobs: Array<{ id: string; next_run_at: string | null }> };
+};
+
 export type Paper = {
   id: number;
   run_id: number;
@@ -80,6 +99,12 @@ export type RunDetail = {
     pdf_url: string;
     note_markdown: string;
     image_paths: string[];
+    quality?: {
+      passed: boolean;
+      score: number;
+      mode: "verified" | "extractive_fallback" | "failed" | string;
+      metrics: Record<string, number | boolean>;
+    } | null;
   }>;
   backtests: Array<{
     id: number;
@@ -102,23 +127,28 @@ export type RunDetail = {
 export type SettingsPayload = {
   defaults: Record<string, string | number | boolean>;
   runtime: Record<string, string>;
+  secret_configured: Record<string, boolean>;
 };
 
 export type PublishByCodesResponse = {
   requested: string[];
   results: Array<{
     code: string;
-    status: "PUBLISHED" | "FAILED" | "NOT_FOUND" | "ALREADY_PUBLISHED" | string;
+    status: "PUBLISHED" | "PENDING" | "PUBLISHING" | "PUBLISH_UNCERTAIN" | "FAILED" | "NOT_FOUND" | "ALREADY_PUBLISHED" | string;
     zhihu_url?: string;
     error?: string;
   }>;
   stats?: {
     PUBLISHED: number;
     DRAFT?: number;
+    PENDING?: number;
+    PUBLISH_UNCERTAIN?: number;
     ALREADY_PUBLISHED: number;
     FAILED: number;
     RATE_LIMITED?: number;
     NOT_FOUND: number;
+    SUPERSEDED?: number;
+    QUALITY_BLOCKED?: number;
   };
   ok?: boolean;
   message?: string;

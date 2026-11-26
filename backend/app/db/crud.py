@@ -1,10 +1,12 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.db.models import AppSetting, BacktestReport, EmailCommandLog, Paper, PaperNote, PublicationTask, WorkflowRun
+from app.core.config import Settings
+from app.db.models import AppSetting, ArticleRevisionTask, BacktestReport, EmailCommandLog, Paper, PaperNote, PublicationTask, WorkflowRun
 
 
 def create_run(db: Session, trigger_source: str) -> WorkflowRun:
@@ -37,6 +39,60 @@ def finish_run(
 def list_runs(db: Session, limit: int = 20) -> list[WorkflowRun]:
     stmt = select(WorkflowRun).order_by(desc(WorkflowRun.id)).limit(limit)
     return list(db.scalars(stmt).all())
+
+
+def scheduled_run_state(db: Session, settings: Settings, now: datetime | None = None) -> dict:
+    """Use durable run history, not the scheduler's in-memory fire time."""
+    local_now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(settings.timezone))
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    scheduled_at = midnight.replace(hour=settings.schedule_hour, minute=settings.schedule_minute)
+    start = midnight.astimezone(timezone.utc).replace(tzinfo=None)
+    end = (midnight + timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None)
+    runs = list(db.scalars(select(WorkflowRun).where(
+        WorkflowRun.trigger_source == "scheduler",
+        WorkflowRun.started_at >= start,
+        WorkflowRun.started_at < end,
+    ).order_by(desc(WorkflowRun.id))).all())
+    state = {
+        "date": local_now.date().isoformat(), "scheduled_at": scheduled_at.isoformat(),
+        "attempts": len(runs), "last_run_id": runs[0].id if runs else None,
+        "last_status": runs[0].status if runs else None, "due": False,
+    }
+    if local_now < scheduled_at:
+        state["reason"] = "before_schedule"
+    elif any(run.status in {"SUCCESS", "PARTIAL"} for run in runs):
+        state["reason"] = "completed"
+    elif any(run.status == "RUNNING" for run in runs):
+        state["reason"] = "running"
+    elif len(runs) >= 3:
+        state["reason"] = "daily_retry_limit_reached"
+    elif runs and local_now.astimezone(timezone.utc).replace(tzinfo=None) < (
+        (runs[0].ended_at or runs[0].started_at) + timedelta(minutes=30)
+    ):
+        state["reason"] = "retry_backoff"
+    else:
+        state.update(due=True, reason="retry_due" if runs else "not_started")
+    return state
+
+
+def recover_interrupted_work(db: Session) -> dict[str, int]:
+    """Called before workers start in the single-process deployment."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    runs = list(db.scalars(select(WorkflowRun).where(WorkflowRun.status == "RUNNING")).all())
+    for run in runs:
+        run.status = "INTERRUPTED"
+        run.ended_at = now
+        run.error_message = "Backend restarted before this run finished; scheduled work will be reconsidered."
+    revisions = list(db.scalars(select(ArticleRevisionTask).where(ArticleRevisionTask.status == "RUNNING")).all())
+    for task in revisions:
+        task.status = "PENDING"
+        task.next_attempt_at = now
+    publications = list(db.scalars(select(PublicationTask).where(PublicationTask.status == "PUBLISHING")).all())
+    for task in publications:
+        task.status = "PUBLISH_UNCERTAIN"
+        task.error_message = "Backend restarted during publication; verify the public result before retrying."
+    db.commit()
+    return {"runs": len(runs), "revisions": len(revisions), "uncertain_publications": len(publications)}
 
 
 def delete_run(db: Session, run_id: int) -> bool:

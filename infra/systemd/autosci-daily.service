@@ -1,0 +1,13 @@
+[Unit]
+Description=Wake AutoSci daily workflow (idempotent)
+Requires=autosci-backend.service
+After=network-online.target autosci-backend.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/usr/bin/curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 5 --retry-max-time 120 --max-time 10 --request POST http://127.0.0.1:8000/api/workflow/scheduled
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true

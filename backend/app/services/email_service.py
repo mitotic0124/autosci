@@ -1,4 +1,5 @@
 import logging
+import html
 import re
 import smtplib
 import textwrap
@@ -17,6 +18,25 @@ class EmailService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
+    def send_workflow_alert(self, run_id: int, error: str) -> bool:
+        if not (self._settings.smtp_host and self._settings.mail_to):
+            return False
+        username = self._settings.smtp_username or self._settings.mail_from
+        password = self._settings.smtp_password or self._settings.imap_password
+        mail_from = self._settings.mail_from or username
+        if not mail_from:
+            return False
+        message = MIMEText(
+            f"AutoSci 自动任务 Run #{run_id} 尚未确认完成公开发布。\n\n{error[:3000]}\n\n"
+            "请查看控制台中的任务错误。未通过质量核验的内容不会发布；发布结果不确定时不会重复提交。",
+            "plain", "utf-8",
+        )
+        message["Subject"] = f"[AutoSci] 自动任务需要关注 (Run #{run_id})"
+        message["From"] = mail_from
+        message["To"] = self._settings.mail_to
+        raw = message.as_string()
+        return self._deliver(raw, mail_from, username, password)
+
     def send_paper_code_digest(self, run_id: int, tasks: list[PublicationTask]) -> bool:
         if not (self._settings.smtp_host and self._settings.mail_to):
             return False
@@ -28,14 +48,33 @@ class EmailService:
             return False
 
         message = MIMEMultipart("mixed")
-        message["Subject"] = f"[AutoSci] 今日论文编号 (Run #{run_id})"
+        published_count = sum(
+            1 for task in tasks
+            if task.status == "PUBLISHED" and getattr(task, "zhihu_url", None)
+        )
+        if tasks and published_count == len(tasks):
+            subject_prefix = "今日论文已确认公开"
+        elif published_count:
+            subject_prefix = "今日论文部分公开，其余待发布"
+        else:
+            subject_prefix = "今日论文已核验，尚未确认公开"
+        message["Subject"] = f"[AutoSci] {subject_prefix} (Run #{run_id})"
         message["From"] = mail_from
         message["To"] = self._settings.mail_to
 
         card_attachments = self._build_markdown_card_attachments(run_id=run_id, tasks=tasks, max_cards=3)
         html_lines = [
-            f"<h2>AutoSci 今日论文编号 (Run #{run_id})</h2>",
-            "<p>回复命令示例：<strong>发布R005-01,R005-03</strong></p>",
+            f"<h2>AutoSci 今日论文自动发布状态 (Run #{run_id})</h2>",
+            (
+                (
+                    "<p>自动发布模式：以下文章已通过质量核验并进入自动发布队列；本邮件不表示已经公开。"
+                    "只有任务状态为 <strong>PUBLISHED</strong> 且存在公开链接，才算发布成功。</p>"
+                    if published_count < len(tasks)
+                    else "<p>以下文章均已通过官方记录核验并确认公开。</p>"
+                )
+                if self._settings.workflow_auto_publish_after_run and self._settings.zhihu_auto_publish
+                else "<p>回复命令示例：<strong>发布R005-01,R005-03</strong></p>"
+            ),
             (
                 f"<p>已附上 {len(card_attachments)} 份论文总结 PNG 卡片（邮件附件）。</p>"
                 if card_attachments
@@ -44,7 +83,11 @@ class EmailService:
             "<ul>",
         ]
         for task in tasks:
-            html_lines.append(f"<li><strong>{task.paper_code}</strong> | {task.title} | 状态: {task.status}</li>")
+            url = getattr(task, "zhihu_url", None)
+            link = f' | <a href="{html.escape(url, quote=True)}">阅读已发表文章</a>' if task.status == "PUBLISHED" and url else ""
+            error = getattr(task, "error_message", None)
+            detail = f"<br>待处理原因：{html.escape(str(error))}" if error else ""
+            html_lines.append(f"<li><strong>{html.escape(task.paper_code)}</strong> | {html.escape(task.title)} | 状态: {html.escape(task.status)}{link}{detail}</li>")
         html_lines.append("</ul>")
         message.attach(MIMEText("\n".join(html_lines), "html", "utf-8"))
 
@@ -54,6 +97,11 @@ class EmailService:
             message.attach(image_part)
 
         raw = message.as_string()
+        return self._deliver(raw, mail_from, username, password)
+
+    def _deliver(self, raw: str, mail_from: str, username: str | None, password: str | None) -> bool:
+        if self._settings.smtp_port == 465:
+            return self._send_via_ssl(raw, mail_from, username, password)
         if self._send_via_starttls(raw, mail_from, username, password):
             return True
         return self._send_via_ssl(raw, mail_from, username, password)
@@ -237,19 +285,34 @@ class EmailService:
         username: str | None,
         password: str | None,
     ) -> bool:
+        server = None
+        delivered = False
         try:
             server = smtplib.SMTP(self._settings.smtp_host, self._settings.smtp_port, timeout=30)
-            try:
-                if self._settings.smtp_use_tls:
-                    server.starttls()
-                if username and password:
-                    server.login(username, password)
-                server.sendmail(mail_from, [self._settings.mail_to], raw_message)
-                return True
-            finally:
-                server.quit()
-        except Exception:
-            return False
+            if self._settings.smtp_use_tls:
+                server.starttls()
+            if username and password:
+                server.login(username, password)
+            server.sendmail(mail_from, [self._settings.mail_to], raw_message)
+            delivered = True
+        except Exception as exc:
+            logger.warning(
+                "SMTP STARTTLS delivery failed via %s:%s (%s): %s",
+                self._settings.smtp_host,
+                self._settings.smtp_port,
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    try:
+                        server.close()
+                    except Exception:
+                        pass
+        return delivered
 
     def _send_via_ssl(
         self,
@@ -258,14 +321,28 @@ class EmailService:
         username: str | None,
         password: str | None,
     ) -> bool:
+        server = None
+        delivered = False
         try:
             server = smtplib.SMTP_SSL(self._settings.smtp_host, 465, timeout=30)
-            try:
-                if username and password:
-                    server.login(username, password)
-                server.sendmail(mail_from, [self._settings.mail_to], raw_message)
-                return True
-            finally:
-                server.quit()
-        except Exception:
-            return False
+            if username and password:
+                server.login(username, password)
+            server.sendmail(mail_from, [self._settings.mail_to], raw_message)
+            delivered = True
+        except Exception as exc:
+            logger.warning(
+                "SMTP SSL delivery failed via %s:465 (%s): %s",
+                self._settings.smtp_host,
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    try:
+                        server.close()
+                    except Exception:
+                        pass
+        return delivered

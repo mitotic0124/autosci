@@ -44,40 +44,14 @@ app.mount("/artifacts", StaticFiles(directory=artifacts_dir), name="artifacts")
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         runtime = crud.list_settings(db)
-    finally:
-        db.close()
-
-    int_fields = {
-        "schedule_hour",
-        "schedule_minute",
-        "paper_count",
-        "arxiv_max_candidates",
-        "paper_history_lookback_days",
-        "smtp_port",
-        "imap_port",
-        "command_poll_interval_seconds",
-    }
-    bool_fields = {
-        "smtp_use_tls",
-        "imap_use_ssl",
-        "zhihu_headless",
-        "zhihu_publish_enabled",
-        "zhihu_auto_publish",
-        "workflow_auto_publish_after_run",
-    }
-    for key, value in runtime.items():
-        if not hasattr(settings, key):
-            continue
-        if key in int_fields:
-            cast_value = int(value)
-        elif key in bool_fields:
-            cast_value = value.lower() in {"1", "true", "yes", "on"}
-        else:
-            cast_value = value
-        setattr(settings, key, cast_value)
+        workflow_service._apply_settings_map(settings, runtime)
+        recovery = crud.recover_interrupted_work(db)
+        logging.getLogger(__name__).info("Startup recovery: %s", recovery)
+        backfill = workflow_service.backfill_quality_revisions(db)
+        if backfill.get("queued"):
+            logging.getLogger(__name__).info("Recovered %s rejected article checkpoint(s) for automatic revision.", backfill["queued"])
 
     scheduler_service.start()
 

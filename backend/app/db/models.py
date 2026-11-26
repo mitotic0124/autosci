@@ -29,6 +29,9 @@ class WorkflowRun(Base):
         back_populates="run",
         cascade="all, delete-orphan",
     )
+    article_revisions: Mapped[list["ArticleRevisionTask"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan",
+    )
 
 
 class Paper(Base):
@@ -122,3 +125,22 @@ class EmailCommandLog(Base):
     status: Mapped[str] = mapped_column(String(24), default="RECEIVED")
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ArticleRevisionTask(Base):
+    __tablename__ = "article_revision_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("workflow_runs.id"), index=True)
+    arxiv_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    candidate_json: Mapped[str] = mapped_column(Text)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    artifact_dir: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    run: Mapped["WorkflowRun"] = relationship(back_populates="article_revisions")

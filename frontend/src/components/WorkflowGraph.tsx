@@ -3,35 +3,39 @@ import type { Edge, Node } from "reactflow";
 
 import type { WorkflowGraph, WorkflowProgress } from "../types";
 
+const STATUS_LABELS: Record<string, string> = {
+  pending: "待处理", active: "进行中", done: "已完成", failed: "失败",
+};
+
 function styleByStatus(status: string | undefined): { border: string; background: string; color: string; shadow: string } {
   switch (status) {
     case "active":
       return {
-        border: "2px solid #d97706",
-        background: "#fff7e6",
-        color: "#92400e",
-        shadow: "0 0 0 3px rgba(217, 119, 6, 0.18)",
+        border: "2px solid #b9791d",
+        background: "#fff4dc",
+        color: "#7c4b08",
+        shadow: "0 0 0 3px rgba(185, 121, 29, 0.13)",
       };
     case "done":
       return {
-        border: "1px solid #2f855a",
-        background: "#ebfff2",
-        color: "#1f5136",
-        shadow: "0 8px 18px rgba(47, 133, 90, 0.12)",
+        border: "1px solid #3d8a65",
+        background: "#e8f4ed",
+        color: "#245f43",
+        shadow: "0 5px 12px rgba(39, 118, 83, 0.09)",
       };
     case "failed":
       return {
-        border: "1px solid #c53030",
-        background: "#fff0f0",
-        color: "#7f1d1d",
-        shadow: "0 8px 18px rgba(197, 48, 48, 0.15)",
+        border: "1px solid #c85a5a",
+        background: "#fdecec",
+        color: "#8a2929",
+        shadow: "0 5px 12px rgba(181, 60, 60, 0.1)",
       };
     default:
       return {
-        border: "1px solid #0f172a1a",
-        background: "#fffef9",
-        color: "#1f2937",
-        shadow: "0 10px 20px rgba(15, 23, 42, 0.05)",
+        border: "1px solid #d6dde2",
+        background: "#ffffff",
+        color: "#26333e",
+        shadow: "0 4px 10px rgba(23, 32, 42, 0.05)",
       };
   }
 }
@@ -44,22 +48,22 @@ function toFlow(graph: WorkflowGraph, progress: WorkflowProgress | null): { node
     const stylePreset = styleByStatus(status);
     return {
       id: item.id,
-      position: { x: (idx % 3) * 260, y: Math.floor(idx / 3) * 170 },
+      position: { x: (idx % 3) * 240, y: Math.floor(idx / 3) * 150 },
       data: {
         label: (
           <div>
             <div>{item.label}</div>
-            <div style={{ fontSize: 12, marginTop: 6, opacity: 0.85 }}>状态: {status ?? "pending"}</div>
+            <div style={{ fontSize: 11, marginTop: 6, opacity: 0.78 }}>状态：{STATUS_LABELS[status ?? "pending"]}</div>
           </div>
         ),
       },
       type: "default",
       style: {
-        borderRadius: 14,
+        borderRadius: 6,
         border: stylePreset.border,
         background: stylePreset.background,
-        width: 220,
-        fontSize: 13,
+        width: 200,
+        fontSize: 12,
         fontWeight: 600,
         color: stylePreset.color,
         padding: 10,
@@ -72,8 +76,8 @@ function toFlow(graph: WorkflowGraph, progress: WorkflowProgress | null): { node
     id: `edge-${idx}`,
     source: item.source,
     target: item.target,
-    markerEnd: { type: MarkerType.ArrowClosed, width: 18, height: 18, color: "#334155" },
-    style: { stroke: "#334155", strokeWidth: 1.5 },
+    markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: "#687580" },
+    style: { stroke: "#8a959f", strokeWidth: 1.3 },
   }));
 
   return { nodes, edges };
@@ -86,16 +90,24 @@ type Props = {
 
 export function WorkflowGraphPanel({ graph, progress }: Props) {
   if (!graph) {
-    return <div className="panel-empty">Workflow 图加载中...</div>;
+    return <div className="panel-empty">工作流加载中...</div>;
   }
   const flow = toFlow(graph, progress);
   return (
+    <>
+    <ol className="workflow-mobile" aria-label="工作流步骤">
+      {graph.nodes.map((item, index) => {
+        const status = progress?.node_status[item.id] ?? "pending";
+        return <li key={item.id} className={status}><span>{index + 1}</span><div>{item.label}<small>{STATUS_LABELS[status]}</small></div></li>;
+      })}
+    </ol>
     <div className="workflow-box">
-      <ReactFlow nodes={flow.nodes} edges={flow.edges} fitView>
-        <MiniMap zoomable pannable />
+      <ReactFlow nodes={flow.nodes} edges={flow.edges} fitView nodesDraggable={false}>
+        <MiniMap zoomable pannable nodeBorderRadius={4} />
         <Controls />
-        <Background gap={16} color="#e2e8f0" />
+        <Background gap={18} color="#e4e9ec" />
       </ReactFlow>
     </div>
+    </>
   );
 }

@@ -2,11 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "reactflow/dist/style.css";
 
-import App from "./App";
-import "./styles.css";
+import DashboardApp from "./DashboardApp";
+import "./dashboard.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <DashboardApp />
   </React.StrictMode>,
 );

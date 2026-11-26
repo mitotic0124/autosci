@@ -1,5 +1,65 @@
 # Task Checklist
 
+## 2026-11-20 Pending queue recovery (deployed)
+
+- [x] Identified today's PENDING cause as a transient MathJax/editor metric
+  mismatch followed by an over-aggressive full-day interaction gate.
+- [x] Kept a real account cooldown and daily publish-attempt ledger while
+  allowing unattended recovery after pre-publish failures.
+- [x] Added cooldown preflight so retries do not consume task retry budgets
+  while the account is cooling down; capped retry backoff at two hours.
+- [x] Added serialized DOM render evidence for both draft and official-record
+  formula verification.
+- [x] Automatically retried and verified R106-01 through the official API and
+  reconciled it to `PUBLISHED` without duplicate submission.
+
+## 2026-11-19 Automatic topic selection (deployed)
+
+- [x] Added authenticated Zhihu topic-autocomplete API requests to the
+  publication workflow.
+- [x] Ranked topic candidates by exact match, article-context inclusion, and
+  token overlap; rejected candidates below the configured relevance threshold.
+- [x] Added runtime settings for enable/disable, maximum topic count, and
+  minimum relevance; defaults are enabled with `投资`, max 2, threshold 0.45.
+- [x] Kept UI-state verification for selected topics and the target column,
+  with an explicit failure instead of publishing when neither API nor current
+  valid tags can satisfy the threshold.
+- [x] Verified the live production endpoint returns topic candidates with the
+  current Zhihu session; deployed backend restart completed and 176 tests pass.
+
+## 2026-11-19 Two-day pending publication root cause (fixed)
+
+- [x] Verified the server Zhihu session is valid; login was not the current blocker.
+- [x] Reproduced the actual pre-publish failure: stale exact topic `量化研究` was not searchable in the current picker.
+- [x] Reproduced the second UI issue: column radio remained `不发布到专栏` after a nominal Playwright `check()`.
+- [x] Switched required topic to currently available `投资` and added real-state radio verification/fallback clicks.
+- [x] Verified R106 without publishing: selected topic `投资`, `columnOn=true`, column `量化研究速递`.
+- [x] Kept the queue safe; no duplicate or unverified submission was made.
+
+## 2026-11-17 Run 108 session expiry (recovered)
+
+- [x] Confirmed Run 108 had no public URL and was blocked by an expired Zhihu login session.
+- [x] Restored only Zhihu-domain cookies from the authorized local Firefox profile; server writer returned HTTP 200 and signed-in editor.
+- [x] Deleted local and remote temporary session files after verification.
+- [x] Confirmed automatic queue order: R106-01, R107-01, R108-01; next window will retry R106-01 first.
+- [x] Kept today's consumed interaction slot intact; no forced same-day retry or duplicate submission.
+
+## 2026-11-16 Run 106/107 publication-state bug (fixed)
+
+- [x] Confirmed R107-01 was `PENDING` with no public URL; the email did not correspond to a confirmed publication.
+- [x] Found stale-draft identity risk: arbitrary `/p/{id}` links on the writer page could be mistaken for the new draft.
+- [x] Removed that fallback and added response-header ID extraction; missing identity now fails closed.
+- [x] Changed automatic digest subjects/body to distinguish verified `PUBLISHED` from queued/pending work.
+- [x] Kept R106-01/R107-01 queued without forcing another same-day Zhihu interaction; 174 server tests pass.
+
+## 2026-11-14 Run 105 arXiv/Kimi outage (diagnosed)
+
+- [x] Confirmed Run 105 failed before article generation because arXiv returned HTTP 429/timeout.
+- [x] Added the arXiv client `User-Agent`/Atom `Accept` headers and verified a live 40-candidate read.
+- [x] Confirmed the independent provider blocker: Kimi Code weekly quota returns HTTP 429 `exceeded_current_quota_error`.
+- [x] Kept the run failed and unpublished; no unverified or duplicate article was submitted.
+- [x] Deployed the fix; backend and 07:00 Asia/Shanghai timer remain active/enabled; 172 backend tests pass.
+
 ## 2026-11-11 run 98 provider-quota incident (completed)
 
 - [x] Read the console/API error and matched it to the production log: every model call returned Kimi HTTP 429 "5-hour usage limit" (not an article quality defect).
@@ -8,7 +68,7 @@
 - [x] Fixed maintenance-worker starvation: bounded lock wait plus staggered scheduler start offsets so publication/revision/mail workers run when the one-minute catch-up probe holds the lock.
 - [x] Allowed explicit operator checkpoint resumes (`manual=True, run_id=...`) to bypass automatic daily-capacity gates without bypassing verified-quality publication gates.
 - [x] Added a bounded image-count settle retry for the official published-record check; content/formula/topic/column/image-identity checks stay strict.
-- [x] Deployed the changes, restarted the backend, and passed 170 backend tests locally and on the server.
+- [x] Deployed the changes, restarted the backend, and passed 172 backend tests locally and on the server.
 - [x] Repaired publication worker published the verified backlog R097-01; the first read was held `PUBLISH_UNCERTAIN` without resubmission.
 - [x] Read-only owner-authenticated verification passed (exact published ID/title, prose and 48 formulas, 2 loaded figures with original identities, topics and column) and the task was reconciled to `PUBLISHED`.
 - [x] Public URL confirmed: https://zhuanlan.zhihu.com/p/2103909683891279810.

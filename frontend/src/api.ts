@@ -7,6 +7,7 @@
   PublishByCodesResponse,
   RunDetail,
   SettingsPayload,
+  ServiceHealth,
   WorkflowGraph,
   WorkflowProgress,
   WorkflowRun,
@@ -23,8 +24,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`${response.status}: ${message}`);
+    const rawMessage = await response.text();
+    let message = rawMessage;
+    try {
+      const payload = JSON.parse(rawMessage) as { detail?: string; message?: string };
+      message = payload.detail ?? payload.message ?? rawMessage;
+    } catch {
+      // Keep non-JSON error bodies unchanged.
+    }
+    throw new Error(message || `请求失败（${response.status}）`);
   }
 
   return (await response.json()) as T;
@@ -92,6 +100,28 @@ export function getWorkflowGraph(): Promise<WorkflowGraph> {
 
 export function getWorkflowProgress(): Promise<WorkflowProgress> {
   return request<WorkflowProgress>("/api/workflow/progress");
+}
+
+export function getServiceHealth(): Promise<ServiceHealth> {
+  return request<ServiceHealth>("/health");
+}
+
+export function resetZhihuBreaker(confirmedOfficialPageClear: boolean): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>("/api/zhihu/breaker/reset", {
+    method: "POST",
+    body: JSON.stringify({ confirmed_official_page_clear: confirmedOfficialPageClear }),
+  });
+}
+
+export function reconcilePublication(
+  code: string,
+  published: boolean,
+  publicUrl?: string,
+): Promise<{ code: string; status: string; zhihu_url: string }> {
+  return request(`/api/publications/${encodeURIComponent(code)}/reconcile`, {
+    method: "POST",
+    body: JSON.stringify({ confirmed: true, published, public_url: publicUrl }),
+  });
 }
 
 export function getSettings(): Promise<SettingsPayload> {

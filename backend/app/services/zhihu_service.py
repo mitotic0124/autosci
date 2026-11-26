@@ -40,6 +40,53 @@ class ZhihuPublishUncertainError(ZhihuPublicationError):
     """The publish request may have committed; retrying could create a duplicate."""
 
 
+class _FormulaRenderSnapshotParser(HTMLParser):
+    """Count rendered TeX spans in a serialized editor DOM snapshot."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._target: dict[str, bool] | None = None
+        self._depth = 0
+        self.items: list[dict[str, bool]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        classes = values.get("class") or ""
+        if self._target is None and tag == "span" and values.get("data-tex") is not None:
+            self._target = {"rendered": False, "error": False}
+            self._depth = 1
+            return
+        if self._target is None:
+            return
+        self._depth += 1
+        if tag in {"svg", "math", "mjx-container"} or "katex" in classes:
+            self._target["rendered"] = True
+        if any(token.lower() in f"{tag} {classes}".lower() for token in ("MathJax_Error", "merror", "katex-error", "data-mjx-error")):
+            self._target["error"] = True
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, _tag: str) -> None:
+        if self._target is None:
+            return
+        self._depth -= 1
+        if self._depth <= 0:
+            self.items.append(self._target)
+            self._target = None
+            self._depth = 0
+
+    @classmethod
+    def state(cls, markup: str) -> tuple[int, int]:
+        if not isinstance(markup, str):
+            return 0, 1
+        parser = cls()
+        parser.feed(markup)
+        unrendered = sum(not item["rendered"] or item["error"] for item in parser.items)
+        return len(parser.items), unrendered
+
+
 class ZhihuPublicationWindowClosed(RuntimeError):
     pass
 
@@ -260,10 +307,11 @@ class ZhihuService:
         if not profile_path:
             raise RuntimeError("未找到 Firefox 登录配置，请设置 ZHIHU_FIREFOX_PROFILE_PATH。")
         if will_publish:
-            # Reserve an account-wide interaction slot before opening Firefox.
-            # A failed browser/network attempt must still cool down; otherwise
-            # the scheduler could repeatedly hit the same account in one day.
-            self._ensure_daily_interaction_capacity()
+            # Keep a cooldown between browser attempts, but do not make one
+            # failed pre-publish validation consume the whole local day. The
+            # publication-attempt ledger still enforces the daily public-post
+            # limit, while the cooldown lets the unattended worker recover
+            # from transient editor/math-rendering failures later the same day.
             self._ensure_interaction_cooldown()
             self._reserve_interaction()
 
@@ -331,7 +379,7 @@ class ZhihuService:
                     inserted_images = self._upload_images(page, image_slots)
                 session_confirmed = True
                 try:
-                    self._configure_publication_settings(page)
+                    self._configure_publication_settings(page, article_context=f"{title}\n{source_body}")
                 except RuntimeError as exc:
                     if "未找到“发布到专栏”选项" not in str(exc):
                         raise
@@ -342,7 +390,7 @@ class ZhihuService:
                     page.wait_for_timeout(2000)
                     self._check_access_block(page)
                     self._dismiss_creator_assistant(page)
-                    self._configure_publication_settings(page)
+                    self._configure_publication_settings(page, article_context=f"{title}\n{source_body}")
                 self._assert_draft_rendered(page, source_body, fill_mode)
                 if not self._is_edit_url(draft_url) or replace_content:
                     self._assert_images_rendered(page, inserted_images)
@@ -350,7 +398,7 @@ class ZhihuService:
                 self._validate_saved_draft(page, saved_url, title, source_body, len(image_slots))
                 if not will_publish:
                     return saved_url
-                self._configure_publication_settings(page)
+                self._configure_publication_settings(page, article_context=f"{title}\n{source_body}")
                 self._ensure_browser_interactable(page)
                 self._reserve_publication_attempt(reservation_key)
                 with page.expect_response(
@@ -497,13 +545,111 @@ class ZhihuService:
             )
         except Exception:
             pass
-    def _configure_publication_settings(self, page) -> None:
-        """Set and verify the required topic tags and column before saving/publishing."""
-        tags = [
+    @staticmethod
+    def _topic_normalize(value: str) -> str:
+        return re.sub(r"[\s\u200b\ufeff]+", "", str(value or "")).lower()
+
+    @staticmethod
+    def _topic_tokens(value: str) -> set[str]:
+        return {
+            token.lower()
+            for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9+#.-]{1,}", str(value or ""))
+        }
+
+    def _topic_api_candidates(self, page, query: str) -> list[dict]:
+        query = re.sub(r"\s+", " ", str(query or "")).strip()
+        if not query:
+            return []
+        url = (
+            "https://zhuanlan.zhihu.com/api/autocomplete/topics?"
+            f"token={quote(query)}&max_matches=8&use_similar=0&topic_filter=1"
+        )
+        try:
+            response = page.context.request.get(url, timeout=15_000)
+            if response.status != 200:
+                logger.warning("Zhihu topic API returned HTTP %s for query %s", response.status, query)
+                return []
+            payload = response.json()
+            if not isinstance(payload, list):
+                return []
+            return [
+                item for item in payload
+                if isinstance(item, dict) and item.get("type") == "topic" and str(item.get("name") or "").strip()
+            ]
+        except Exception as exc:
+            logger.warning("Zhihu topic API request failed for %s: %s", query, exc)
+            return []
+
+    def _topic_candidate_score(self, candidate: dict, query: str, article_context: str) -> float:
+        name = str(candidate.get("name") or "").strip()
+        normalized_name = self._topic_normalize(name)
+        normalized_query = self._topic_normalize(query)
+        context_normalized = self._topic_normalize(article_context)
+        if normalized_name == normalized_query:
+            return 1.0
+        if normalized_name and normalized_name in context_normalized:
+            return 0.92
+        name_tokens = self._topic_tokens(name)
+        query_tokens = self._topic_tokens(query)
+        context_tokens = self._topic_tokens(article_context)
+        query_overlap = len(name_tokens & query_tokens) / max(1, len(name_tokens))
+        context_overlap = len(name_tokens & context_tokens) / max(1, len(name_tokens))
+        return 0.55 * query_overlap + 0.45 * context_overlap
+
+    def _auto_select_topic_names(self, page, configured_tags: list[str], article_context: str) -> list[str]:
+        current = self._publication_settings_state(page).get("selectedTags", [])
+        configured = [tag for tag in configured_tags if tag]
+        if not bool(getattr(self._settings, "zhihu_topic_api_enabled", True)):
+            return configured
+
+        max_count = max(1, int(getattr(self._settings, "zhihu_topic_max_count", 2)))
+        minimum = max(0.0, min(1.0, float(getattr(self._settings, "zhihu_topic_min_relevance", 0.45))))
+        selected: list[str] = [tag for tag in configured if tag in current]
+        queries = list(configured)
+        context_lines = str(article_context or "").splitlines()
+        title = context_lines[0] if context_lines else ""
+        title_queries = re.findall(r"[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9+#.-]{1,11}", title)
+        queries.extend(chunk for chunk in title_queries if self._topic_normalize(chunk) not in {self._topic_normalize(q) for q in queries})
+
+        scored: dict[str, tuple[float, str]] = {}
+        for query in queries[:8]:
+            candidates = self._topic_api_candidates(page, query)
+            for candidate in candidates:
+                name = str(candidate.get("name") or "").strip()
+                score = self._topic_candidate_score(candidate, query, article_context)
+                key = self._topic_normalize(name)
+                if key and (key not in scored or score > scored[key][0]):
+                    scored[key] = (score, name)
+
+        for tag in configured:
+            if tag in selected:
+                continue
+            exact = scored.get(self._topic_normalize(tag))
+            if exact and exact[0] >= minimum:
+                selected.append(exact[1])
+
+        for score, name in sorted(scored.values(), key=lambda item: item[0], reverse=True):
+            if len(selected) >= max_count:
+                break
+            if score < minimum or any(self._topic_normalize(name) == self._topic_normalize(item) for item in selected):
+                continue
+            selected.append(name)
+
+        if not selected:
+            if current:
+                return current[:max_count]
+            raise RuntimeError("知乎话题 API 未返回与文章相关性达到阈值的话题。")
+        logger.info("Zhihu topic selection: configured=%s selected=%s", configured, selected[:max_count])
+        return selected[:max_count]
+
+    def _configure_publication_settings(self, page, *, article_context: str = "") -> None:
+        """Select API-resolved relevant topics and verify the column before publishing."""
+        configured_tags = [
             re.sub(r"\s+", " ", value).strip()
             for value in str(getattr(self._settings, "zhihu_default_tags", "") or "").split(",")
             if re.sub(r"\s+", " ", value).strip()
         ]
+        tags = self._auto_select_topic_names(page, configured_tags, article_context)
         column_name = re.sub(r"\s+", " ", str(getattr(self._settings, "zhihu_column_name", "") or "")).strip()
 
         if tags:
@@ -597,7 +743,28 @@ class ZhihuService:
                 if not radio.is_checked():
                     radio.check(force=True)
             except Exception:
-                radio.evaluate("(element) => element.click()")
+                pass
+            # Zhihu's custom RadioButton can report a successful Playwright
+            # check without updating React state. Click the associated label
+            # and fall back to the input itself, then wait for the real checked
+            # property before opening the column selector.
+            if not radio.is_checked():
+                label = page.locator("label[for='PublishPanel-columnLabel-1']").first
+                try:
+                    if label.count() > 0:
+                        label.click(timeout=4_000, force=True)
+                except Exception:
+                    pass
+            if not radio.is_checked():
+                try:
+                    radio.evaluate("element => { element.click(); element.dispatchEvent(new Event('change', {bubbles: true})); }")
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not radio.is_checked():
+                page.wait_for_timeout(200)
+            if not radio.is_checked():
+                raise RuntimeError("知乎发布设置未能启用“发布到专栏”。")
             page.wait_for_timeout(900)
 
             state = self._publication_settings_state(page)
@@ -1954,7 +2121,7 @@ class ZhihuService:
                     raise RuntimeError(f"正文导入失败：知乎提示“{token}”。")
             raise RuntimeError(f"正文写入校验失败，当前正文长度仅 {length} 字符。")
     def _assert_draft_rendered(self, page, source_body: str, fill_mode: str) -> None:
-        self._wait_for_math_rendering(page)
+        serialized_rendering_confirmed = self._wait_for_math_rendering(page)
         page.wait_for_timeout(1200)
         metrics = self._read_editor_metrics(page)
         editor_text = str(metrics.get("text", "")).strip()
@@ -1974,6 +2141,12 @@ class ZhihuService:
         unrendered_formulas = int(metrics.get("unrenderedFormulaCount", 0) or 0)
         if malformed_formulas:
             raise RuntimeError(f"知乎草稿存在 {malformed_formulas} 个内容污染的公式节点，已中止保存。")
+        if unrendered_formulas and serialized_rendering_confirmed:
+            logger.info(
+                "Zhihu editor metrics lagged serialized DOM; serialized render proof covers %s nodes.",
+                unrendered_formulas,
+            )
+            unrendered_formulas = 0
         if unrendered_formulas:
             raise RuntimeError(f"知乎草稿有 {unrendered_formulas} 个公式未生成可视图形，仍显示 LaTeX 占位文本，已中止保存。")
         if actual_formulas != expected_formulas:
@@ -2033,7 +2206,7 @@ class ZhihuService:
         self._save_draft_validation_snapshot(page, draft_url, source_body)
 
     @staticmethod
-    def _wait_for_math_rendering(page) -> None:
+    def _wait_for_math_rendering(page) -> bool:
         """Drive Zhihu's lazy MathJax renderer before validating the draft.
 
         A long imported article can contain dozens of equations. Zhihu only
@@ -2042,13 +2215,40 @@ class ZhihuService:
         valid draft. Revisit every formula for a bounded number of rounds and
         inspect the same metrics used by the quality gate after each round.
         """
-        deadline = time.time() + 45
+        # Long imported drafts can leave a few MathJax nodes in their
+        # placeholder state for more than one editor repaint. Give the
+        # browser a full bounded settle window before rejecting the draft;
+        # otherwise a transient render lag consumes the only unattended
+        # publication attempt for the day.
+        deadline = time.time() + 90
         last_state: tuple[int, int] | None = None
         while time.time() < deadline:
             formulas = page.locator("span[data-tex]")
             formula_count = formulas.count()
             if formula_count == 0:
-                return
+                return False
+
+            # The editor observes viewport changes asynchronously. Scrolling
+            # all nodes in one tight Playwright loop can leave the last few
+            # formulas in a placeholder state, so give each node a short
+            # render turn and explicitly request a MathJax typeset pass when
+            # the page exposes the standard API.
+            try:
+                page.evaluate(
+                    """async () => {
+                      const nodes = Array.from(document.querySelectorAll('span[data-tex]'));
+                      for (const node of nodes) {
+                        node.scrollIntoView({block: 'center', inline: 'nearest'});
+                        node.dispatchEvent(new Event('scroll', {bubbles: true}));
+                        await new Promise(resolve => setTimeout(resolve, 80));
+                      }
+                      if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+                        try { await window.MathJax.typesetPromise(nodes); } catch (error) {}
+                      }
+                    }"""
+                )
+            except Exception:
+                pass
 
             for index in range(formula_count):
                 try:
@@ -2069,7 +2269,7 @@ class ZhihuService:
                 unrendered_count = int(metrics.get("unrenderedFormulaCount", 0) or 0)
                 state = (rendered_count, unrendered_count)
                 if rendered_count == formula_count and unrendered_count == 0:
-                    return
+                    return True
                 if state != last_state:
                     logger.info(
                         "Waiting for Zhihu formula rendering: rendered=%s/%s, unrendered=%s",
@@ -2083,6 +2283,19 @@ class ZhihuService:
                 # next round will reacquire the current formula nodes.
                 pass
             page.wait_for_timeout(500)
+
+        try:
+            # Serializing the live DOM forces Playwright to observe the final
+            # MathJax subtree after its asynchronous replacement.
+            page.content()
+            page.wait_for_timeout(2_500)
+            serialized_count, serialized_unrendered = _FormulaRenderSnapshotParser.state(page.content())
+            if serialized_count > 0 and serialized_unrendered == 0:
+                logger.info("Zhihu serialized editor DOM confirms %s rendered formulas.", serialized_count)
+                return True
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _read_editor_metrics(page) -> dict:
@@ -2346,6 +2559,17 @@ class ZhihuService:
                     match = re.search(r"/(?:p|articles?)/(\d{10,})", url)
                     if match:
                         article_id = match.group(1)
+                if not article_id:
+                    try:
+                        headers = response.headers
+                        for name in ("location", "x-article-id", "x-draft-id"):
+                            value = str(headers.get(name, ""))
+                            match = re.search(r"/(?:p|articles?)/(\d{10,})", value) or re.search(r"(?:draft|article)[_-]?(\d{10,})", value, re.I)
+                            if match:
+                                article_id = match.group(1)
+                                break
+                    except Exception:
+                        pass
                 tracker["events"].append(
                     {
                         "status": int(response.status),
@@ -2403,7 +2627,9 @@ class ZhihuService:
                 draft_url = f"https://zhuanlan.zhihu.com/p/{article_id}/edit" if article_id else self._resolve_draft_url(page)
                 # Existing edit pages can be verified by the subsequent reload
                 # even if this run did not emit a fresh network response.
-                has_persisted_identity = bool(save_events) or self._is_edit_url(draft_url)
+                has_persisted_identity = self._is_edit_url(draft_url) and (
+                    bool(save_events) or self._is_edit_url(page.url)
+                )
                 if not has_persisted_identity:
                     page.wait_for_timeout(500)
                     continue
@@ -2453,35 +2679,10 @@ class ZhihuService:
         if match:
             return f"https://zhuanlan.zhihu.com/p/{match.group(1)}/edit"
 
-        try:
-            links = page.evaluate(
-                """
-                () => Array.from(document.querySelectorAll("a[href]"))
-                  .map(item => item.href || "")
-                  .filter(Boolean)
-                  .slice(0, 400)
-                """
-            )
-            if isinstance(links, list):
-                for href in links:
-                    if not isinstance(href, str):
-                        continue
-                    if "/p/" not in href:
-                        continue
-                    id_match = re.search(r"/p/(\\d+)", href)
-                    if id_match:
-                        return f"https://zhuanlan.zhihu.com/p/{id_match.group(1)}/edit"
-        except Exception:
-            pass
-
-        try:
-            html = page.content()
-        except Exception:
-            html = ""
-        html_match = re.search(r"https?://zhuanlan\\.zhihu\\.com/p/(\\d+)/edit", html)
-        if html_match:
-            return html_match.group(0)
-
+        # Never select an arbitrary article link from the writer page. The
+        # page may contain an older article, and using its ID here can update
+        # the wrong draft on retry. A new draft must expose its own ID in the
+        # save response or redirect to an edit URL.
         return current
 
     @staticmethod
@@ -2598,6 +2799,11 @@ class ZhihuService:
             self._assert_published_image_loads(page.context.request, source)
         metrics["invalidImageCount"] = rendered.get("invalidImageCount", 1)
         metrics["unrenderedFormulaCount"] = rendered.get("unrenderedFormulaCount", 1)
+        if metrics["unrenderedFormulaCount"]:
+            serialized_count, serialized_unrendered = _FormulaRenderSnapshotParser.state(page.content())
+            if serialized_count == self._count_latex_formulas(source_body) and serialized_unrendered == 0:
+                logger.info("Zhihu published owner DOM confirms %s rendered formulas.", serialized_count)
+                metrics["unrenderedFormulaCount"] = 0
         self._assert_public_content(metrics, source_body, expected_images)
         state = self._load_zhihu_state()
         state["public_readback_mode"] = "published_api"
@@ -3002,10 +3208,15 @@ class ZhihuService:
         return last.astimezone(tz).date() == datetime.now(tz).date()
 
     def _ensure_daily_interaction_capacity(self) -> None:
-        if self.has_interacted_today():
-            raise ZhihuPublicationWindowClosed(
-                "本日知乎账号交互次数已达上限；本次失败或未完成的任务保留队列，等待下一个自然日窗口。"
-            )
+        """Compatibility hook; cooldown and publish quota are the real gates.
+
+        Older deployments treated any failed browser attempt as a full-day
+        account interaction. That stranded the queue after a transient draft
+        validation failure. The persisted interaction timestamp remains
+        observable, but automatic retries are governed by the configured
+        interval and the separate daily publication-attempt ledger.
+        """
+        return
 
     def _reserve_interaction(self) -> None:
         state = self._load_zhihu_state()

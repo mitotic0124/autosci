@@ -1,5 +1,150 @@
 # Deployment status
 
+## 2026-11-20: Pending queue recovery and unattended retry fix
+
+Run 111 produced a verified article, but the first automatic browser attempt
+hit a transient Zhihu MathJax/editor-render metric mismatch. The old safety
+gate then treated that pre-publish failure as a full-day account interaction,
+so later retries were recorded as `PENDING` instead of recovering
+automatically.
+
+Deployed fixes:
+
+- A failed pre-publish validation no longer consumes the whole local day.
+  The account cooldown remains 30 minutes, and the separate daily public-post
+  ledger still prevents duplicate or over-quota submissions.
+- The retry worker checks the cooldown before consuming retry budget, permits
+  same-day recovery, and caps exponential backoff at two hours.
+- Zhihu's lazy MathJax rendering is driven node-by-node. When live editor
+  metrics lag, a serialized DOM proof is required before accepting the render;
+  the same proof is used during official published-record verification.
+- Formula-rendering failures are classified as retryable automatic failures.
+
+After deployment, R106-01 retried without a user message. The authenticated
+official article API returned `state=published`, matching ID/title/body,
+21 formulas, 2 images, topic `投资`, and column `量化研究速递`; the task was
+reconciled to `PUBLISHED` at
+`https://zhuanlan.zhihu.com/p/2106284777515111821`. The remaining queue is
+still ordered and will be processed automatically in the next daily window;
+no confirmation email is required.
+
+## 2026-11-19: Authenticated topic API selection added
+
+The publisher now resolves topics through Zhihu's authenticated
+`/api/autocomplete/topics` endpoint instead of assuming that a configured
+literal tag is still searchable. Candidates are ranked against the article
+title and source context, filtered by a configurable relevance threshold, and
+limited to the configured maximum count. The selected topic tags are still
+verified in the real editor before the draft is saved or submitted; API
+failure falls back to already-selected valid tags and never silently submits
+an untagged article.
+
+Runtime defaults are enabled with `投资` as the stable configured topic,
+`ZHIHU_TOPIC_MAX_COUNT=2`, and `ZHIHU_TOPIC_MIN_RELEVANCE=0.45`. The API
+request was verified on the production login session (HTTP 200, returning
+`量化`, `量化交易`, `量化研究`, and `量化宽松`). The backend was restarted
+with the change and the full **176-test** suite passes locally and on the
+server. No manual message or confirmation is required for the next scheduled
+workflow.
+
+## 2026-11-19: Root cause of two-day pending queue found and fixed
+
+The server was logged in correctly; this was not a login failure. The actual
+blocker was a Zhihu editor UI/configuration mismatch:
+
+- The account's current topic picker kept the existing `投资` tag, while the
+  stored required tags were the no-longer-searchable exact names
+  `量化研究,论文`. Publication stopped before the publish request with
+  `知乎话题搜索未找到：量化研究`.
+- The current editor's custom column radio could report a successful Playwright
+  `check()` without changing React state. The page therefore remained on
+  `不发布到专栏`, even though the column dropdown was visible.
+
+Fixes deployed and verified against the saved R106 draft:
+
+- Required topic changed to the account's currently available `投资` topic.
+- Column selection now clicks the associated label/input, waits for the real
+  checked state, and fails explicitly if `发布到专栏` is not enabled.
+- R106 draft verification now reports `selectedTags=[投资]`,
+  `columnOn=true`, and `columnText=量化研究速递` without clicking Publish.
+- Server login remains valid (`session_error=""`); the failure was not an
+  expired session.
+
+The queued tasks remain safe and ordered (`R106-01` first). The next fresh
+daily interaction will use the corrected topic and column flow; no manual
+confirmation is needed.
+
+## 2026-11-17: Run 108 login-session recovery and next-window readiness
+
+Run 108 completed article verification but its oldest queued publication was
+blocked because the server Zhihu session had expired. This was an actual
+authentication failure, not a publish success or a public-page read restriction.
+The local Firefox profile's Zhihu-domain session was explicitly authorized for
+one recovery, transferred through a temporary file, verified against the writer
+(`HTTP 200`, signed in, real editor), persisted to the private server profile,
+and removed from both local and remote temporary locations.
+
+Current readiness:
+
+- `/health` reports `session_error=""`, `zhihu_rate_limit.active=false`, and
+  automatic publication enabled.
+- The automatic queue is exactly `R106-01`, `R107-01`, `R108-01`, in that
+  order; all are `PENDING` with no public URL. The next daily window will try
+  `R106-01` first.
+- Today's interaction slot is already consumed, so no extra same-day browser
+  request is forced. The next eligible automatic window is 2026-11-18 07:00
+  Asia/Shanghai, with the refreshed session and stale-draft protection active.
+
+The server backend and daily timer remain active/enabled; the 174-test suite
+passed on the deployed code.
+
+## 2026-11-16: Run 106/107 false-publication notification and stale-draft fix
+
+Run 107 generated and quality-verified an article, but `R107-01` remained
+`PENDING`; no confirmed public URL existed. The automatic digest was sent as a
+queue/status message, but its previous subject and wording were too easy to
+read as a publication confirmation. The actual publication queue also exposed
+a safety bug: when Zhihu's writer page had links to an older article, the draft
+resolver could select the first unrelated `/p/{id}` link as the new draft
+identity. That caused the publisher to stop on the wrong old editor instead of
+publishing the new task.
+
+Deployed fixes:
+
+- A new draft URL is accepted only from the current edit route or the draft
+  save response (including `Location`/ID response headers). Arbitrary writer
+  page links are never used as a new article identity.
+- Missing draft identity now fails closed instead of risking an old article
+  update or a duplicate publish.
+- Automatic digest subjects and body now distinguish `PUBLISHED` with a
+  verified URL from `PENDING`, `FAILED`, or queued tasks. A pending digest says
+  explicitly that it is not a publication confirmation.
+- R106/R107 remain safely queued; no new interaction is forced inside the same
+  Zhihu daily interaction window. The next eligible window retries the oldest
+  task first.
+
+The server backend is active and the full **174-test** regression suite passes.
+
+## 2026-11-14: Run 105 arXiv rate-limit diagnosis and fix
+
+Run 105 did not reach article generation or publication. The first failure was
+the arXiv API returning HTTP 429/timeout after three requests. The deployed
+client now identifies itself with `User-Agent: AutoSci/1.0` and
+`Accept: application/atom+xml`, preserves the official HTTPS fallback, and has
+been verified against the live server with a single read-only query returning
+40 candidates. A recent 72-hour candidate cache is also used when all API
+attempts fail. The arXiv-specific regression suite and the full 172-test
+backend suite pass on the server.
+
+The current daily retry budget is intentionally exhausted after three bounded
+attempts. A separate blocker is also present: Kimi Code is returning HTTP 429
+with `exceeded_current_quota_error` (weekly usage limit). This is an account
+quota condition, not an article-quality or Zhihu publication failure. The
+workflow remains stopped rather than generating or publishing unverified text;
+after the Kimi quota window resets or the account is upgraded, the next daily
+window will retry automatically. The 07:00 Asia/Shanghai timer and backend are
+active/enabled, and no publication was submitted for Run 105.
+
 ## 2026-11-11: run 98 provider-quota outage; publication worker starvation fixed; R097-01 published and verified
 
 Run 98 (scheduled 2026-11-11 07:00 Asia/Shanghai) failed without publishing. The
@@ -21,7 +166,7 @@ shared the same trigger second, and the non-blocking workflow lock made the
 publication worker lose every time. The verified article R097-01 therefore
 stayed `PENDING` for a day.
 
-Fixes deployed and tested (170 backend tests pass locally and on the server):
+Fixes deployed and tested (172 backend tests pass locally and on the server):
 
 - HTTP 429 (quota/rate limit) and three consecutive transport/5xx failures now
   raise a terminal `LLMProviderUnavailable`, stop all model requests in the run,

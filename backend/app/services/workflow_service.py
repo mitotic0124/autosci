@@ -35,6 +35,7 @@ class WorkflowService:
         "paper_history_lookback_days",
         "zhihu_max_publications_per_day",
         "zhihu_min_interaction_interval_seconds",
+        "zhihu_topic_max_count",
         "imap_port",
         "command_poll_interval_seconds",
         "article_max_source_chars",
@@ -53,13 +54,14 @@ class WorkflowService:
         "llm_max_output_tokens",
         "llm_thinking_budget",
     }
-    FLOAT_FIELDS = {"article_min_figure_score", "article_quality_threshold"}
+    FLOAT_FIELDS = {"article_min_figure_score", "article_quality_threshold", "zhihu_topic_min_relevance"}
     BOOL_FIELDS = {
         "smtp_use_tls",
         "imap_use_ssl",
         "zhihu_headless",
         "zhihu_publish_enabled",
         "zhihu_auto_publish",
+        "zhihu_topic_api_enabled",
         "workflow_auto_publish_after_run",
         "article_fetch_arxiv_source",
         "article_require_verified",
@@ -856,6 +858,10 @@ class WorkflowService:
             if not self._publication_service.daily_publication_window_open():
                 return {"skipped": True, "reason": "outside_daily_publication_window"}
             self._publication_service._zhihu_service._ensure_not_rate_limited()
+            # Do not consume a task retry budget while the account-level
+            # browser cooldown is active. The next maintenance tick will
+            # resume the same oldest task after the cooldown expires.
+            self._publication_service._zhihu_service._ensure_interaction_cooldown()
             if self._publication_service.remaining_daily_publications(db) <= 0:
                 return {"skipped": True, "reason": "daily_publication_limit_reached"}
             # PublicationTask.created_at is stored as a naive UTC timestamp.
@@ -891,20 +897,13 @@ class WorkflowService:
                         previous_attempt = datetime.fromisoformat(last_attempt_at.replace("Z", "+00:00"))
                         if previous_attempt.tzinfo is None:
                             previous_attempt = previous_attempt.replace(tzinfo=timezone.utc)
-                        try:
-                            local_tz = ZoneInfo(self._settings.timezone)
-                        except Exception:
-                            local_tz = timezone.utc
                         now_utc = datetime.now(timezone.utc)
-                        if previous_attempt.astimezone(local_tz).date() == now_utc.astimezone(local_tz).date():
-                            # A failed pre-publish attempt still counts as
-                            # today's platform interaction. Do not hammer the
-                            # account every five minutes after a UI/network
-                            # failure; retry in the next daily window.
-                            continue
-                        # Back off within a day, then give the task one fresh
-                        # attempt on each later daily window.
-                        wait_seconds = min(24 * 60 * 60, 15 * 60 * (2 ** attempts))
+                        # Back off between attempts, but allow recovery later
+                        # on the same day. The Zhihu service enforces the
+                        # configured account cooldown and the separate daily
+                        # public-publication quota; a failed pre-publish
+                        # validation must not strand the queue until tomorrow.
+                        wait_seconds = min(2 * 60 * 60, 15 * 60 * (2 ** min(attempts, 3)))
                         if now_utc - previous_attempt.astimezone(timezone.utc) < timedelta(seconds=wait_seconds):
                             continue
                     except ValueError:
